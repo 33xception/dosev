@@ -1,3 +1,10 @@
+# [1.9.7] – 2026-11-01
+
+## Fixed
+
+- **DNSSEC validation now fails closed** – Responses that fail validation or are determined to be bogus now return `SERVFAIL` instead of being served without successful validation.
+- **Upstream response questions are validated** – Responses with malformed or mismatched question sections are rejected across UDP, TCP, TLS, DoH, HTTP/3, and DoQ transports.
+
 # [1.9.6] – 2026-08-07
 
 ## Fixed
