@@ -202,7 +202,7 @@ class TestDNSSECChain:
             iterations=0,
             salt=b'',
             next=b'aaaaaaaaaaaaaaaa',
-            windows=[(0, b'\x00')]
+            windows=[]
         )
         nsec3_rrset = dns.rrset.RRset(dns.name.from_text("aaaaaaaaaaaaaaaa.example.com."), dns.rdataclass.IN, dns.rdatatype.NSEC3)
         nsec3_rrset.ttl = 3600
@@ -266,7 +266,7 @@ class TestDNSSECChain:
             iterations=0,
             salt=b'',
             next=next_example,
-            windows=[(0, b'\x00')],
+            windows=[],
         )
         nsec3_example_rrset = dns.rrset.RRset(dns.name.from_text(f"{hash_map['example.com.']}.example.com."), dns.rdataclass.IN, dns.rdatatype.NSEC3)
         nsec3_example_rrset.ttl = 3600
@@ -280,7 +280,7 @@ class TestDNSSECChain:
             iterations=0,
             salt=b'',
             next=next_wildcard,
-            windows=[(0, b'\x00')],
+            windows=[],
         )
         nsec3_wildcard_rrset = dns.rrset.RRset(dns.name.from_text(f"{hash_map['*.example.com.']}.example.com."), dns.rdataclass.IN, dns.rdatatype.NSEC3)
         nsec3_wildcard_rrset.ttl = 3600
@@ -354,7 +354,7 @@ class TestDNSSECChain:
             iterations=0,
             salt=b'',
             next=next_example,
-            windows=[(0, b'\x00')],
+            windows=[],
         )
         nsec3_example_rrset = dns.rrset.RRset(dns.name.from_text(f"{hash_map['example.com.']}.example.com."), dns.rdataclass.IN, dns.rdatatype.NSEC3)
         nsec3_example_rrset.ttl = 3600
@@ -369,7 +369,7 @@ class TestDNSSECChain:
             iterations=0,
             salt=b'',
             next=wrap_example,
-            windows=[(0, b'\x00')],
+            windows=[],
         )
         nsec3_wildcard_rrset = dns.rrset.RRset(dns.name.from_text(f"{hash_map['*.example.com.']}.example.com."), dns.rdataclass.IN, dns.rdatatype.NSEC3)
         nsec3_wildcard_rrset.ttl = 3600
@@ -440,7 +440,7 @@ class TestDNSSECChain:
             iterations=0,
             salt=b'',
             next=b"\x22" * 20,
-            windows=[(0, b'\x00')],
+            windows=[],
         )
         nsec3_rrset = dns.rrset.RRset(dns.name.from_text(f"{hash_map['foo.example.com.']}.example.com."), dns.rdataclass.IN, dns.rdatatype.NSEC3)
         nsec3_rrset.ttl = 3600
@@ -503,7 +503,7 @@ class TestDNSSECChain:
             iterations=0,
             salt=b'',
             next=b"\x66" * 20,
-            windows=[(0, b'\x00')],
+            windows=[],
         )
         nsec3_example_rrset = dns.rrset.RRset(dns.name.from_text(f"{hash_map['example.com.']}.example.com."), dns.rdataclass.IN, dns.rdatatype.NSEC3)
         nsec3_example_rrset.ttl = 3600
@@ -566,7 +566,7 @@ class TestDNSSECChain:
             iterations=0,
             salt=b'',
             next=b"\x33" * 20,
-            windows=[(0, b'\x00')],
+            windows=[],
         )
         nsec3_example_rrset = dns.rrset.RRset(dns.name.from_text(f"{hash_map['example.com.']}.example.com."), dns.rdataclass.IN, dns.rdatatype.NSEC3)
         nsec3_example_rrset.ttl = 3600
@@ -580,7 +580,7 @@ class TestDNSSECChain:
             iterations=0,
             salt=b'',
             next=b"\x22" * 20,
-            windows=[(0, b'\x00')],
+            windows=[],
         )
         nsec3_wildcard_rrset = dns.rrset.RRset(dns.name.from_text(f"{hash_map['*.example.com.']}.example.com."), dns.rdataclass.IN, dns.rdatatype.NSEC3)
         nsec3_wildcard_rrset.ttl = 3600
@@ -661,7 +661,7 @@ class TestDNSSECChain:
             iterations=0,
             salt=b'',
             next=b"\x55" * 20,
-            windows=[(0, b'\x00')],
+            windows=[],
         )
         nsec3_example_rrset = dns.rrset.RRset(dns.name.from_text(f"{hash_map['example.com.']}.example.com."), dns.rdataclass.IN, dns.rdatatype.NSEC3)
         nsec3_example_rrset.ttl = 3600
@@ -675,7 +675,7 @@ class TestDNSSECChain:
             iterations=0,
             salt=b'',
             next=b"\x66" * 20,
-            windows=[(0, b'\x00')],
+            windows=[],
         )
         nsec3_wildcard_rrset = dns.rrset.RRset(dns.name.from_text(f"{hash_map['*.example.com.']}.example.com."), dns.rdataclass.IN, dns.rdatatype.NSEC3)
         nsec3_wildcard_rrset.ttl = 3600
@@ -756,7 +756,7 @@ class TestDNSSECChain:
             iterations=0,
             salt=b'',
             next=b"\x66" * 20,
-            windows=[(0, b'\x00')],
+            windows=[],
         )
         nsec3_example_rrset = dns.rrset.RRset(dns.name.from_text(f"{hash_map['example.com.']}.example.com."), dns.rdataclass.IN, dns.rdatatype.NSEC3)
         nsec3_example_rrset.ttl = 3600
@@ -819,7 +819,7 @@ class TestDNSSECChain:
             iterations=0,
             salt=b'',
             next=b"\x66" * 20,
-            windows=[(0, b'\x00')],
+            windows=[],
         )
         nsec3_example_rrset = dns.rrset.RRset(dns.name.from_text(f"{hash_map['example.com.']}.example.com."), dns.rdataclass.IN, dns.rdatatype.NSEC3)
         nsec3_example_rrset.ttl = 3600
@@ -833,7 +833,7 @@ class TestDNSSECChain:
             iterations=0,
             salt=b'',
             next=b"\x77" * 20,
-            windows=[(0, b'\x00')],
+            windows=[],
         )
         nsec3_wildcard_rrset = dns.rrset.RRset(dns.name.from_text(f"{hash_map['*.example.com.']}.example.com."), dns.rdataclass.IN, dns.rdatatype.NSEC3)
         nsec3_wildcard_rrset.ttl = 3600
