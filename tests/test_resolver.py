@@ -233,6 +233,15 @@ async def test_cached_answer_uses_remaining_ttl_and_client_edns(monkeypatch):
     resolver = DNSResolver(
         upstreams=[{"address": "1.1.1.1", "protocol": "udp", "ip": "1.1.1.1"}]
     )
+
+    class Clock:
+        now = 1000.0
+
+        def time(self):
+            return self.now
+
+    clock = Clock()
+    monkeypatch.setattr("dosev.resolver.time", clock)
     calls = 0
 
     async def fake_upstream(upstream, data):
@@ -249,6 +258,7 @@ async def test_cached_answer_uses_remaining_ttl_and_client_edns(monkeypatch):
     query = dns.message.make_query("example.com", "A")
     first = await resolver.forward_dns_query(query.to_wire())
     assert dns.message.from_wire(first).edns == -1
+    clock.now += 2.0
 
     edns_query = dns.message.make_query("example.com", "A")
     edns_query.use_edns(payload=1232)
@@ -259,7 +269,7 @@ async def test_cached_answer_uses_remaining_ttl_and_client_edns(monkeypatch):
     assert cached.opt is not None
     assert cached.payload == 1232
     assert not (cached.ednsflags & dns.flags.DO)
-    assert cached.answer[0].ttl < 300
+    assert cached.answer[0].ttl == 298
 
 
 @pytest.mark.asyncio
