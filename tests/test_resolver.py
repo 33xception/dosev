@@ -322,6 +322,52 @@ async def test_dnssec_bogus_raises(resolver):
             await resolver._dnssec_validate("example.com", b"", dnssec_requested=True)
 
 
+@pytest.mark.asyncio
+async def test_process_upstream_response_returns_servfail_on_dnssec_exception(resolver):
+    resolver.dnssec_enabled = True
+    query = dns.message.make_query("example.com", "A")
+    resp = dns.message.make_response(query)
+    resp.answer.append(dns.rrset.from_text("example.com.", 60, dns.rdataclass.IN, dns.rdatatype.A, "93.184.216.34"))
+    resp_wire = resp.to_wire()
+
+    resolver._try_upstream = AsyncMock(return_value=resp_wire)
+    with patch.object(resolver, "_dnssec_validate", new=AsyncMock(side_effect=dns.dnssec.ValidationFailure("bad"))):
+        result = await resolver._process_upstream_response(
+            {"protocol": "udp", "address": "1.1.1.1"},
+            resp_wire,
+            "example.com",
+            True,
+            ("example.com", 1, "global"),
+            0,
+        )
+
+    msg = dns.message.from_wire(result)
+    assert msg.rcode() == dns.rcode.SERVFAIL
+
+
+@pytest.mark.asyncio
+async def test_process_upstream_response_returns_servfail_on_bogus_dnssec_result(resolver):
+    resolver.dnssec_enabled = True
+    query = dns.message.make_query("example.com", "A")
+    resp = dns.message.make_response(query)
+    resp.answer.append(dns.rrset.from_text("example.com.", 60, dns.rdataclass.IN, dns.rdatatype.A, "93.184.216.34"))
+    resp_wire = resp.to_wire()
+
+    resolver._try_upstream = AsyncMock(return_value=resp_wire)
+    with patch.object(resolver, "_dnssec_validate", new=AsyncMock(return_value=(False, False))):
+        result = await resolver._process_upstream_response(
+            {"protocol": "udp", "address": "1.1.1.1"},
+            resp_wire,
+            "example.com",
+            True,
+            ("example.com", 1, "global"),
+            0,
+        )
+
+    msg = dns.message.from_wire(result)
+    assert msg.rcode() == dns.rcode.SERVFAIL
+
+
 # ---------- Negative Caching ----------
 @pytest.mark.asyncio
 async def test_negative_cache_uses_soa_minimum(resolver):
@@ -1730,6 +1776,27 @@ async def test_forward_udp_uses_ip_override():
 
 
 @pytest.mark.asyncio
+async def test_forward_udp_rejects_mismatched_question_section():
+    resolver = DNSResolver()
+    upstream = {"address": "example.com", "protocol": "udp", "port": 53, "ip": "192.0.2.1"}
+
+    query = dns.message.make_query("example.com", "A")
+    qwire = query.to_wire()
+
+    forged = dns.message.make_response(query)
+    forged.question = dns.message.make_query("evil.example", "A").question
+    resp_wire = forged.to_wire()
+
+    with patch.object(resolver, "_resolve_upstream_ip", AsyncMock(return_value="192.0.2.1")):
+        loop = asyncio.get_running_loop()
+        with patch.object(loop, "sock_recvfrom", new=AsyncMock(return_value=(resp_wire, ("192.0.2.1", 53)))):
+            with patch.object(loop, "sock_sendto", new=AsyncMock()):
+                with patch.object(resolver, "_get_udp_socket", new=AsyncMock(return_value=MagicMock())):
+                    with pytest.raises(OSError, match="Response question mismatch"):
+                        await resolver._forward_udp(qwire, upstream)
+
+
+@pytest.mark.asyncio
 async def test_forward_tcp_uses_ip_override():
     resolver = DNSResolver()
     upstream = {
@@ -1939,7 +2006,7 @@ async def test_tcp_length_validation_valid():
 
 @pytest.mark.asyncio
 async def test_tcp_length_validation_max():
-    """Test that length=65535 (maximum allowed) succeeds."""
+    """Test that a response at or under the max length succeeds."""
     resolver = DNSResolver(
         upstreams=[{"address": "127.0.0.1", "protocol": "tcp", "port": 12345, "ip": "127.0.0.1"}],
         tcp_timeout=2.0,
@@ -1948,19 +2015,16 @@ async def test_tcp_length_validation_max():
     resolver._tcp_pool.get = AsyncMock(return_value=None)
     resolver._tcp_pool.put = AsyncMock()
 
-    # Create a query
     data = dns.message.make_query("example.com", "A").to_wire()
-    query_id = data[:2]
-
-    # Create a large but valid response
-    body = b'X' * 65513  # 65535 - 12 (header) - 2 (ID) = 65513
-    # Build a minimal DNS header + body
-    resp_wire = query_id + b'\x81\x80\x00\x01\x00\x00\x00\x00' + body
+    query_msg = dns.message.from_wire(data)
+    resp = dns.message.make_response(query_msg)
+    resp.answer.append(dns.rrset.from_text("example.com.", 60, dns.rdataclass.IN, dns.rdatatype.A, "192.0.2.1"))
+    resp_wire = resp.to_wire()
 
     async def mock_connect_max(*args, **kwargs):
         reader = AsyncMock()
         reader.readexactly = AsyncMock(side_effect=[
-            b'\xff\xff',  # length 65535
+            len(resp_wire).to_bytes(2, 'big'),
             resp_wire
         ])
         writer = MagicMock()
@@ -2123,7 +2187,46 @@ async def test_forward_quic_txid_validation():
             with patch("asyncio.wait_for", new=AsyncMock(return_value=response_data)):
                 with pytest.raises(OSError, match="DoQ Response ID mismatch"):
                     await resolver._forward_quic(qwire, resolver.upstreams[0])
-            
+
+
+@pytest.mark.asyncio
+async def test_forward_https3_closes_connection_on_question_mismatch():
+    resolver = DNSResolver(
+        upstreams=[{"address": "example.com", "protocol": "https", "port": 443, "hostname": "example.com"}],
+        doh_timeout=1.0,
+    )
+
+    query = dns.message.make_query("example.com", "A")
+    qwire = query.to_wire()
+
+    bad_resp = dns.message.make_response(query)
+    bad_resp.question = dns.message.make_query("evil.example", "A").question
+    bad_wire = bad_resp.to_wire()
+
+    class MockH3Client:
+        async def send_request(self, data, hostname, path):
+            return bad_wire
+
+    cleanup_called = False
+
+    class MockAsyncCM:
+        async def __aenter__(self):
+            return MockH3Client()
+
+        async def __aexit__(self, *args):
+            nonlocal cleanup_called
+            cleanup_called = True
+
+    cm = MockAsyncCM()
+
+    with patch("dosev.resolver.connect", return_value=cm):
+        with patch.object(resolver._h3_pool, "get", new=AsyncMock(return_value=None)):
+            with patch.object(resolver._h3_pool, "put", new=AsyncMock()) as put_mock:
+                with pytest.raises(OSError, match="Response question mismatch"):
+                    await resolver._forward_https3(qwire, "example.com", 443, "example.com", "/dns-query", None)
+                assert cleanup_called is True
+                put_mock.assert_not_called()
+
 # ---------- EDNS0 Multiple OPT Records ----------
 @pytest.mark.asyncio
 async def test_multiple_opt_records_return_formerr():

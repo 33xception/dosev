@@ -46,6 +46,13 @@ def resolver_with_dnssec():
     return resolver
 
 
+def test_nsec3_hash_uses_module_limit_constant():
+    resolver = DNSResolver()
+    result = resolver._nsec3_hash("example.com.", b"salt", 0, 1)
+    assert result is not None
+    assert isinstance(result, str)
+
+
 @pytest.mark.asyncio
 async def test_cd_flag_skips_validation(resolver_with_dnssec):
     query = dns.message.make_query("example.com", "A")

@@ -1,7 +1,3 @@
-# dosev/resolver.py – DNSSEC‑chain‑of‑trust version with full NSEC3 proof and corrected pools
-# Full corrected version – all background tasks are started via `start()` to avoid
-# `RuntimeError: no running event loop` when constructing the resolver outside an async context.
-
 import asyncio
 import logging
 import socket
@@ -76,6 +72,7 @@ try:
     import dns.rdtypes.ANY.NSEC3
     import dns.rdtypes.ANY.DS
     import dns.rdtypes.ANY.DNSKEY
+    import dns.exception
     from dns.rdtypes.ANY.NSEC3 import NSEC3
     from dns.rdtypes.ANY.DS import DS
     from dns.rdtypes.ANY.DNSKEY import DNSKEY
@@ -1725,13 +1722,13 @@ class DNSResolver:
                 continue
         return None
 
-    @staticmethod
+
     def _nsec3_hash(self, name: str, salt: bytes, iterations: int, algorithm: int) -> Optional[str]:
         """Return base32-encoded NSEC3 hash (lowercase, no padding)."""
         if algorithm != 1:
             self.logger.warning("Unsupported NSEC3 algorithm: %d", algorithm)
             return None
-        if iterations > self.MAX_NSEC3_ITERATIONS:
+        if iterations > MAX_NSEC3_ITERATIONS:
             self.logger.warning("NSEC3 iterations (%d) exceed safe limit", iterations)
             return None
         try:
@@ -2947,9 +2944,12 @@ class DNSResolver:
                 secure, insecure = await self._dnssec_validate(qname, resp, dnssec_requested)
                 if secure:
                     dnssec_ok = True
+                elif not insecure:
+                    self.logger.warning("DNSSEC validation bogus for %s", qname)
+                    return self._make_servfail_response(data)
             except Exception as e:
                 self.logger.warning("DNSSEC validation failed for %s: %s", qname, e)
-                raise
+                return self._make_servfail_response(data)
 
         if self.rebind_protection_enabled:
             resp = self._apply_rebind_protection(resp)
@@ -3012,6 +3012,27 @@ class DNSResolver:
             self._udp_sockets[key] = sock
             return sock
 
+    def _validate_response_question(self, query_data: bytes, response_data: bytes, prefix: str = "") -> None:
+        if not query_data or not response_data:
+            raise OSError(f"{prefix} Response question mismatch".strip())
+
+        try:
+            req_msg = dns.message.from_wire(query_data)
+            resp_msg = dns.message.from_wire(response_data)
+        except dns.exception.DNSException as e:
+            self.logger.warning("Malformed DNS response during question validation%s: %s",
+                                f" ({prefix})" if prefix else "", e)
+            raise OSError(f"{prefix} Malformed DNS response".strip()) from e
+
+        if req_msg.question != resp_msg.question:
+            self.logger.warning(
+                "%sresponse question mismatch: sent %s, got %s",
+                f"{prefix} " if prefix else "",
+                req_msg.question,
+                resp_msg.question,
+            )
+            raise OSError(f"{prefix} Response question mismatch".strip())
+
     async def _forward_udp(self, data: bytes, upstream: Dict[str, Any]) -> bytes:
         host = upstream['address']
         port = int(upstream.get('port', 53))
@@ -3059,6 +3080,7 @@ class DNSResolver:
             else:
                 raise OSError("Truncated DNS response")
 
+            self._validate_response_question(data, response)
             return response
 
         except (OSError, socket.error) as e:
@@ -3115,6 +3137,7 @@ class DNSResolver:
                     self.logger.warning("TCP response ID mismatch: sent %d, got %d", sent_id, resp_id)
                     raise OSError("TCP Response ID mismatch")
 
+            self._validate_response_question(data, resp, "TCP")
             await self._tcp_pool.put(key, reader, writer)
             return resp
         except Exception:
@@ -3203,6 +3226,7 @@ class DNSResolver:
                     self.logger.warning("TLS response ID mismatch: sent %d, got %d", sent_id, resp_id)
                     raise OSError("TLS Response ID mismatch")
 
+            self._validate_response_question(data, resp, "TLS")
             await self._tcp_pool.put(key, reader, writer)
             return resp
         except Exception:
@@ -3363,11 +3387,15 @@ class DNSResolver:
                     chunk = await asyncio.wait_for(reader.readexactly(ln), timeout=self.doh_timeout)
                     body.extend(chunk)
                     await asyncio.wait_for(reader.readexactly(2), timeout=self.doh_timeout)
-                return bytes(body)
+                body_bytes = bytes(body)
+                self._validate_response_question(data, body_bytes, "DoH")
+                return body_bytes
             else:
                 if content_length is None:
                     raise Exception("DoH response missing Content-Length and not chunked")
-                return await asyncio.wait_for(reader.readexactly(content_length), timeout=self.doh_timeout)
+                body_bytes = await asyncio.wait_for(reader.readexactly(content_length), timeout=self.doh_timeout)
+                self._validate_response_question(data, body_bytes, "DoH")
+                return body_bytes
         finally:
             writer.close()
             await writer.wait_closed()
@@ -3406,6 +3434,7 @@ class DNSResolver:
             if resp.status_code < 200 or resp.status_code >= 300:
                 raise Exception(f"HTTP/2 upstream returned status {resp.status_code}")
             result = resp.content
+            self._validate_response_question(data, result, "DoH")
             await self._h2_pool.put(key, client)
             return result
         except Exception:
@@ -3451,6 +3480,10 @@ class DNSResolver:
 
         try:
             response = await client.send_request(data, hostname, path)
+            self._validate_response_question(data, response, "DoH")
+            # Success: return connection to pool
+            await self._h3_pool.put(key, client)
+            return response
         except asyncio.CancelledError:
             # Clean up on cancellation (e.g., health‑check timeout)
             if hasattr(client, '_cm'):
@@ -3477,10 +3510,6 @@ class DNSResolver:
                 except Exception:
                     pass
             raise
-        else:
-            # Success: return connection to pool
-            await self._h3_pool.put(key, client)
-            return response
 
     # ---------- DOQ with connection pooling and fragmentation fix ----------
     async def _forward_quic(self, data: bytes, upstream: Dict[str, Any]) -> bytes:
@@ -3607,6 +3636,7 @@ class DNSResolver:
                     self.logger.warning("DoQ response ID mismatch: sent %d, got %d", sent_id, resp_id)
                     raise OSError("DoQ Response ID mismatch")
 
+            self._validate_response_question(data, resp, "DoQ")
             # Store in pool on success
             await self._quic_pool.put(key, client)
             return resp
