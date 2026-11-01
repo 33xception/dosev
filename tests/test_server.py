@@ -9,8 +9,10 @@ import ssl
 import types
 import pytest
 from aiohttp import web
+from unittest.mock import AsyncMock
+import dns.message
 
-from dosev.server import run_server, run_server_sync, reload_resolver, ResolverHolder, _handle_doh_request, _drop_dns_privileges
+from dosev.server import run_server, run_server_sync, reload_resolver, ResolverHolder, UDPResolverProtocol, _handle_doh_request, _drop_dns_privileges, _tcp_handler
 from dosev.resolver import DNSResolver
 
 
@@ -35,6 +37,87 @@ class FakeTCPServer:
 
     async def wait_closed(self):
         pass
+
+
+@pytest.mark.asyncio
+async def test_tcp_handler_serves_multiple_queries_per_connection():
+    query = dns.message.make_query("example.com", "A").to_wire()
+    frames = iter([
+        len(query).to_bytes(2, "big"), query,
+        len(query).to_bytes(2, "big"), query,
+    ])
+
+    class Reader:
+        async def readexactly(self, size):
+            try:
+                return next(frames)
+            except StopIteration:
+                raise asyncio.IncompleteReadError(b"", size)
+
+    class Writer:
+        def __init__(self):
+            self.writes = []
+
+        def get_extra_info(self, name):
+            return ("192.0.2.1", 53000) if name == "peername" else None
+
+        def write(self, data):
+            self.writes.append(data)
+
+        async def drain(self):
+            pass
+
+        def close(self):
+            pass
+
+        async def wait_closed(self):
+            pass
+
+    resolver = DNSResolver()
+    resolver._check_rate_limit = AsyncMock(return_value=True)
+    resolver.is_blocked = AsyncMock(return_value=False)
+    resolver.forward_dns_query = AsyncMock(
+        side_effect=lambda data, **kwargs: dns.message.make_response(
+            dns.message.from_wire(data)
+        ).to_wire()
+    )
+    writer = Writer()
+
+    await _tcp_handler(Reader(), writer, ResolverHolder(resolver))
+
+    assert resolver.forward_dns_query.await_count == 2
+    assert resolver._check_rate_limit.await_count == 2
+    assert len(writer.writes) == 2
+
+
+@pytest.mark.asyncio
+async def test_udp_response_is_truncated_to_client_payload():
+    resolver = DNSResolver()
+    query = dns.message.make_query("example.com", "A")
+    query.use_edns(payload=512)
+    response = dns.message.make_response(query)
+    response.answer.append(dns.rrset.from_text(
+        "example.com.", 60, dns.rdataclass.IN, dns.rdatatype.A,
+        *[f"192.0.2.{index}" for index in range(1, 100)],
+    ))
+    resolver.forward_dns_query = AsyncMock(return_value=response.to_wire(max_size=4096))
+
+    class Transport:
+        def __init__(self):
+            self.sent = None
+
+        def sendto(self, data, addr):
+            self.sent = data
+
+    protocol = UDPResolverProtocol(ResolverHolder(resolver))
+    protocol.transport = Transport()
+    await protocol._handle(query.to_wire(), ("192.0.2.10", 53000))
+
+    sent = protocol.transport.sent
+    parsed = dns.message.from_wire(sent)
+    assert len(sent) <= 512
+    assert parsed.flags & dns.flags.TC
+    assert parsed.question == query.question
 
 
 # ---------- Server run tests ----------
@@ -217,12 +300,15 @@ def test_drop_dns_privileges_drops_privs_when_root(monkeypatch):
 
     def fake_setgid(gid):
         called['setgid'] = gid
+        called.setdefault('order', []).append('setgid')
 
     def fake_setuid(uid):
         called['setuid'] = uid
+        called.setdefault('order', []).append('setuid')
 
     def fake_setgroups(groups):
         called['setgroups'] = groups
+        called.setdefault('order', []).append('setgroups')
 
     def fake_chroot(path):
         called['chroot'] = path
@@ -237,6 +323,7 @@ def test_drop_dns_privileges_drops_privs_when_root(monkeypatch):
     assert called.get('setgid') == 999
     assert called.get('setuid') == 999
     assert called.get('setgroups') == []
+    assert called.get('order') == ['setgroups', 'setgid', 'setuid']
     assert called.get('chroot') == '/var/empty'
 
 

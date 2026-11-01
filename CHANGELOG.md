@@ -1,3 +1,25 @@
+# [1.10.0] – 2026-11-01
+
+## Added
+
+- **Persistent DNS/TCP client connections** – Serve multiple queries on a connection, with per-query rate limiting.
+- **Bounded request handling** – Limit pending UDP queries, concurrent TCP/DoH/HTTP/3 work, and HTTP/3 DNS message sizes.
+
+## Fixed
+
+- **Client-aware ECS and cache isolation** – Forward the transport client's subnet and separate cached or coalesced answers by ECS scope and query semantics.
+- **DNSSEC and EDNS behavior** – Validate when DNSSEC is enabled and CD is clear, regardless of client DO; normalize OPT and DNSSEC records for the client request.
+- **UDP response truncation** – Truncate oversized responses to the client's advertised payload and set TC.
+- **Cache correctness** – Do not cache SERVFAIL or zero-TTL answers; decrement TTLs on cache hits and preserve EDNS metadata.
+- **Connection and task cleanup** – Close failed upstream TCP connections, stop pool and background cleanup tasks, and release HTTP/3 protocols at shutdown.
+- **Privilege dropping** – Clear supplementary groups before changing GID and UID.
+- **HTTP/3 GET handling** – Dispatch header-terminated GET requests and reject oversized request bodies.
+
+## Performance
+
+- **Fallback cache eviction** – Replace full-map expiry scans with constant-time bounded eviction.
+- **Blocklist refresh I/O** – Move writes off the event loop and atomically replace files only after successful downloads.
+
 # [1.9.7] – 2026-11-01
 
 ## Fixed

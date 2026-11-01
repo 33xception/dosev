@@ -114,12 +114,12 @@ MAX_NSEC3_ITERATIONS = 100  # RFC 9276 recommended limit to prevent CPU exhausti
 class AsyncTTLCache:
     """Async-capable TTL cache with optional size limit and per-item TTL."""
     def __init__(self, maxsize: int = 1024, ttl: int = 300) -> None:
-        self._data: Dict[str, Tuple[Any, float]] = {}
+        self._data: Dict[Any, Tuple[Any, float]] = {}
         self._default_ttl: int = ttl
-        self._max: int = maxsize
+        self._max: int = max(1, maxsize)
         self._lock: asyncio.Lock = asyncio.Lock()
 
-    async def get(self, key: str) -> Optional[Any]:
+    async def get(self, key: Any) -> Optional[Any]:
         async with self._lock:
             v = self._data.get(key)
             if v is None:
@@ -130,15 +130,16 @@ class AsyncTTLCache:
                 return None
             return value
 
-    async def set(self, key: str, value: Any, ttl: Optional[int] = None) -> None:
+    async def set(self, key: Any, value: Any, ttl: Optional[int] = None) -> None:
         async with self._lock:
-            if len(self._data) >= self._max:
-                oldest = min(self._data.items(), key=lambda kv: kv[1][1])[0]
-                del self._data[oldest]
+            if key in self._data:
+                del self._data[key]
+            elif len(self._data) >= self._max:
+                del self._data[next(iter(self._data))]
             expiry = time.time() + (ttl if ttl is not None else self._default_ttl)
             self._data[key] = (value, expiry)
 
-    async def delete(self, key: str) -> None:
+    async def delete(self, key: Any) -> None:
         async with self._lock:
             try:
                 if key in self._data:
@@ -158,6 +159,8 @@ class RateLimiter:
         self._cleanup_task: Optional[asyncio.Task] = None
 
     async def start_cleanup(self) -> None:
+        if self._cleanup_task is not None and not self._cleanup_task.done():
+            return
         async def _cleanup():
             while True:
                 await asyncio.sleep(60)
@@ -230,6 +233,8 @@ class ConnectionPool:
             self._pools[key].append((reader, writer, time.time()))
 
     async def start_cleanup(self) -> None:
+        if self._cleanup_task is not None and not self._cleanup_task.done():
+            return
         async def _cleanup():
             while True:
                 await asyncio.sleep(self.idle_timeout / 2)
@@ -300,6 +305,8 @@ class ClientPool:
             self._pools[key].append((client, time.time()))
 
     async def start_cleanup(self) -> None:
+        if self._cleanup_task is not None and not self._cleanup_task.done():
+            return
         async def _cleanup():
             while True:
                 await asyncio.sleep(self.idle_timeout / 2)
@@ -466,6 +473,8 @@ class H3ConnectionPool:
             self._pools[key].append((client, time.time()))
 
     async def start_cleanup(self) -> None:
+        if self._cleanup_task is not None and not self._cleanup_task.done():
+            return
         async def _cleanup():
             while True:
                 await asyncio.sleep(self.idle_timeout / 2)
@@ -918,9 +927,7 @@ class DNSResolver:
             self._insecure_cleanup_task = asyncio.create_task(self._cleanup_insecure_cache())
             self._background_tasks.add(self._insecure_cleanup_task)
 
-        # H3 pool cleanup
-        task = asyncio.create_task(self._h3_pool.start_cleanup())
-        self._background_tasks.add(task)
+        await self.start_pool_cleanups()
 
         # Health checks
         if self._health_enabled and self.upstreams and self._health_task is None:
@@ -1085,6 +1092,7 @@ class DNSResolver:
                         pass
             except Exception:
                 pass
+        self._started = False
 
     # ---------- blocklist helpers ----------
     async def set_blocklist(self, domains: Iterable[str]) -> None:
@@ -1212,7 +1220,7 @@ class DNSResolver:
             resp_bytes, expiry, query_data, stale_until, dnssec_validated = entry
             now = time.time()
             if now < expiry:
-                return resp_bytes, dnssec_validated
+                return self._set_response_ttl(resp_bytes, max(0, int(expiry - now))), dnssec_validated
             if self.optimistic_cache_enabled and now < stale_until:
                 self.logger.debug("serving stale response for %s (age=%.1fs)", key, now - expiry)
                 stale_resp = self._set_response_ttl(resp_bytes, self.stale_response_ttl)
@@ -1284,7 +1292,9 @@ class DNSResolver:
             if key in self._stale_refresh_pending:
                 return
             self._stale_refresh_pending.add(key)
-        asyncio.create_task(self._background_refresh(key, query_data))
+        task = asyncio.create_task(self._background_refresh(key, query_data))
+        self._background_tasks.add(task)
+        task.add_done_callback(self._background_tasks.discard)
 
     async def _background_refresh(self, key: Tuple[str, int, str], query_data: bytes) -> None:
         try:
@@ -1311,7 +1321,7 @@ class DNSResolver:
                                 continue
                     ttl = self._extract_min_ttl(resp)
                     if ttl <= 0:
-                        ttl = 30
+                        return
                     expiry = time.time() + ttl
                     stale_until = expiry + self.stale_max_age if self.optimistic_cache_enabled else expiry
                     val = (resp, expiry, query_data, stale_until, dnssec_ok)
@@ -1331,24 +1341,22 @@ class DNSResolver:
         if _HAS_DNSPY:
             try:
                 msg = dns.message.from_wire(response_bytes)
-                new_msg = dns.message.Message()
-                new_msg.id = msg.id
-                new_msg.flags = msg.flags
-                for q in msg.question:
-                    new_msg.question.append(q)
                 def _replace_ttl(rrset_list):
                     new_list = []
                     for rrset in rrset_list:
+                        if rrset.rdtype == dns.rdatatype.OPT:
+                            new_list.append(rrset)
+                            continue
                         new_rr = dns.rrset.RRset(rrset.name, rrset.rdclass, rrset.rdtype)
                         new_rr.ttl = ttl
                         for rd in rrset:
                             new_rr.add(rd)
                         new_list.append(new_rr)
                     return new_list
-                new_msg.answer = _replace_ttl(msg.answer)
-                new_msg.authority = _replace_ttl(msg.authority)
-                new_msg.additional = _replace_ttl(msg.additional)
-                return new_msg.to_wire()
+                msg.answer = _replace_ttl(msg.answer)
+                msg.authority = _replace_ttl(msg.authority)
+                msg.additional = _replace_ttl(msg.additional)
+                return msg.to_wire()
             except Exception as e:
                 self.logger.debug("_set_response_ttl failed: %s", e)
         return response_bytes
@@ -1369,6 +1377,63 @@ class DNSResolver:
             msg.additional = [rrset for rrset in msg.additional if rrset.rdtype != dns.rdatatype.AAAA]
             return msg.to_wire()
         except Exception:
+            return response_bytes
+
+    def _strip_dnssec_records(self, response_bytes: bytes, qname: Any,
+                              qtype: int) -> bytes:
+        try:
+            message = dns.message.from_wire(response_bytes)
+            dnssec_types = {
+                dns.rdatatype.DS, dns.rdatatype.RRSIG, dns.rdatatype.NSEC,
+                dns.rdatatype.DNSKEY, dns.rdatatype.NSEC3, dns.rdatatype.DLV,
+                dns.rdatatype.CDS, dns.rdatatype.CDNSKEY,
+            }
+
+            def filter_section(section):
+                return [rrset for rrset in section
+                        if rrset.rdtype not in dnssec_types
+                        or (rrset.name == qname and rrset.rdtype == qtype)]
+
+            message.answer = filter_section(message.answer)
+            message.authority = filter_section(message.authority)
+            message.additional = filter_section(message.additional)
+            if message.edns >= 0:
+                message.ednsflags &= ~dns.flags.DO
+            return message.to_wire()
+        except Exception as e:
+            self.logger.debug("DNSSEC record filtering failed: %s", e)
+            return response_bytes
+
+    def _normalize_response_edns(self, response_bytes: bytes,
+                                 request: Any,
+                                 client_requested_do: bool) -> bytes:
+        try:
+            response = dns.message.from_wire(response_bytes)
+            if request.edns < 0:
+                response.use_edns(edns=None)
+                return response.to_wire()
+
+            request_used_ecs = any(
+                option.otype == dns.edns.ECS for option in request.options
+            )
+            options = [
+                option for option in response.options
+                if request_used_ecs or option.otype != dns.edns.ECS
+            ]
+            ednsflags = response.ednsflags
+            if client_requested_do:
+                ednsflags |= dns.flags.DO
+            else:
+                ednsflags &= ~dns.flags.DO
+            response.use_edns(
+                edns=request.edns,
+                ednsflags=ednsflags,
+                payload=request.payload,
+                options=options,
+            )
+            return response.to_wire()
+        except Exception as e:
+            self.logger.debug("Response EDNS normalization failed: %s", e)
             return response_bytes
 
     # ---------- parsing helpers ----------
@@ -2536,14 +2601,15 @@ class DNSResolver:
             result = result[:2] + flags.to_bytes(2, 'big') + result[4:]
         return result
 
-    async def forward_dns_query(self, original_data: bytes, client_ip: Optional[str] = None) -> bytes:
+    async def forward_dns_query(self, original_data: bytes, client_ip: Optional[str] = None,
+                                rate_limit_checked: bool = False) -> bytes:
         """
         Forwards DNS query with rate-limiting, RFC 6891 OPT validation,
         blocklist checking, DNSSEC, ECS, scope-aware caching, rebind protection,
         out-of-bailiwick scrubbing, and IPv6 record stripping.
         """
         # 1. Rate Limiting (cheap, before parsing)
-        if client_ip and self.rate_limiter:
+        if client_ip and self.rate_limiter and not rate_limit_checked:
             if not await self.rate_limiter.is_allowed(client_ip):
                 self.logger.warning("Rate limit exceeded for %s", client_ip)
                 return self._make_rcode_response(original_data, dns.rcode.REFUSED)
@@ -2607,16 +2673,7 @@ class DNSResolver:
             self.logger.info("Blocked query for %s", qname)
             return self.build_block_response(original_data)
 
-        # 5. Build cache key (without ECS for negative cache)
-        cache_key = (qname.lower(), qtype, "global")
-
-        # 6. Negative cache lookup
-        neg_entry = await self._negative_cache_get(cache_key)
-        if neg_entry is not None:
-            self.logger.debug("Negative-cache hit for %s", qname)
-            return self._set_query_id(neg_entry, orig_id)
-
-        # 7. Prepare forward message with EDNS0 ECS
+        # 5. Prepare forward message with EDNS0 ECS
         forward_msg = dns.message.from_wire(original_data)
         if not self.ecs_enabled and forward_msg.options:
             # Remove ECS option by creating a new options list
@@ -2628,6 +2685,7 @@ class DNSResolver:
             )
 
         client_subnet_prefix = 0
+        client_subnet_key = "global"
         if client_ip and self.ecs_enabled:
             try:
                 ip_obj = ipaddress.ip_address(client_ip)
@@ -2642,6 +2700,7 @@ class DNSResolver:
                     subnet_bytes = net.network_address.packed[:7]
                     family = 2
                 client_subnet_prefix = prefix_len
+                client_subnet_key = f"{net.network_address}/{prefix_len}"
                 ecs_data = struct.pack("!HBB", family, prefix_len, 0) + subnet_bytes
                 ecs_option = dns.edns.GenericOption(8, ecs_data)
                 options = [opt for opt in (forward_msg.options or []) if opt.otype != 8]
@@ -2650,24 +2709,70 @@ class DNSResolver:
             except Exception as e:
                 self.logger.debug("Failed to attach ECS: %s", e)
 
+        if self.ecs_enabled and client_subnet_prefix == 0:
+            for option in forward_msg.options or ():
+                if isinstance(option, dns.edns.ECSOption) and option.srclen:
+                    try:
+                        subnet = ipaddress.ip_network(
+                            f"{option.address}/{option.srclen}", strict=False
+                        )
+                        client_subnet_prefix = option.srclen
+                        client_subnet_key = f"{subnet.network_address}/{option.srclen}"
+                    except ValueError:
+                        pass
+                    break
+
+        validate_dnssec = self.dnssec_enabled and not cd_flag
+        if validate_dnssec:
+            forward_msg.use_edns(
+                edns=0,
+                ednsflags=forward_msg.ednsflags | dns.flags.DO,
+                payload=self.max_edns_payload,
+                options=list(forward_msg.options or ()),
+            )
+
+        default_query_context = (
+            msg.question[0].rdclass == dns.rdataclass.IN
+            and not do_flag and not cd_flag and not validate_dnssec
+            and msg.opcode() == 0
+            and bool(msg.flags & dns.flags.RD)
+            and not bool(msg.flags & dns.flags.AD)
+        )
+        cache_context = "" if default_query_context else (
+            f"{msg.question[0].rdclass}:{int(do_flag)}:{int(cd_flag)}:"
+            f"{msg.opcode()}:{int(bool(msg.flags & dns.flags.RD))}:"
+            f"{int(bool(msg.flags & dns.flags.AD))}:{int(validate_dnssec)}:"
+        )
+        cache_scope = f"{cache_context}{client_subnet_key}"
+        cache_key = (qname.lower(), qtype, cache_scope)
+        global_cache_key = (qname.lower(), qtype, f"{cache_context}global")
+
+        # 6. Negative cache lookup
+        neg_entry = await self._negative_cache_get(cache_key)
+        if neg_entry is not None:
+            self.logger.debug("Negative-cache hit for %s", qname)
+            normalized = self._normalize_response_edns(neg_entry, msg, do_flag)
+            return self._set_query_id(normalized, orig_id)
+
         forward_data = forward_msg.to_wire()
 
         # 8. Scope-aware wire cache lookup (positive)
-        cached_entry = None
-        if client_subnet_prefix > 0:
-            subnet_key = (qname.lower(), qtype, f"{client_ip}/{client_subnet_prefix}")
-            cached_entry = await self._wire_cache_get_valid(subnet_key)
-        if cached_entry is None:
-            global_key = (qname.lower(), qtype, "global")
-            cached_entry = await self._wire_cache_get_valid(global_key)
+        cached_entry = await self._wire_cache_get_valid(cache_key)
+        if cached_entry is None and cache_key != global_cache_key:
+            cached_entry = await self._wire_cache_get_valid(global_cache_key)
 
         if cached_entry is not None:
             resp_bytes, _ = cached_entry
             self.logger.debug("Wire-cache hit for %s", qname)
-            return self._set_query_id(resp_bytes, orig_id)
+            normalized = self._normalize_response_edns(resp_bytes, msg, do_flag)
+            return self._set_query_id(normalized, orig_id)
 
         # 9. Flight coalescing (in-flight query deduplication)
-        flight_key = (qname.lower(), qtype, client_subnet_prefix, client_ip if client_subnet_prefix else None)
+        flight_key = (
+            qname.lower(), qtype, msg.question[0].rdclass, msg.opcode(),
+            bool(msg.flags & dns.flags.RD), bool(msg.flags & dns.flags.AD),
+            do_flag, cd_flag, validate_dnssec, client_subnet_key,
+        )
         
         while True:
             existing_future = None
@@ -2680,12 +2785,17 @@ class DNSResolver:
                 else:
                     existing_future = None
                     future = asyncio.get_running_loop().create_future()
+                    future.add_done_callback(
+                        lambda completed: completed.exception()
+                        if not completed.cancelled() else None
+                    )
                     self._flights[flight_key] = future
 
             if existing_future:
                 try:
                     resp = await existing_future
-                    return self._set_query_id(resp, orig_id)   # <-- add this line
+                    normalized = self._normalize_response_edns(resp, msg, do_flag)
+                    return self._set_query_id(normalized, orig_id)
                 except Exception as e:
                     self.logger.debug("Coalesced flight failed: %s", e)
                     continue
@@ -2715,21 +2825,29 @@ class DNSResolver:
                 upstream_list,
                 forward_data,
                 qname,
-                do_flag,
+                validate_dnssec,
                 cache_key,
                 orig_id
             )
 
-            # 11. DNSSEC validation (if enabled and CD flag not set)
-            if self.dnssec_enabled and not cd_flag and do_flag:
-                try:
-                    secure, insecure = await self._dnssec_validate(qname, response, do_flag)
-                    if not secure and not insecure:
-                        self.logger.warning("DNSSEC validation failed for %s", qname)
-                        response = self._make_rcode_response(original_data, dns.rcode.SERVFAIL)
-                except Exception as e:
-                    self.logger.warning("DNSSEC error for %s: %s", qname, e)
-                    response = self._make_rcode_response(original_data, dns.rcode.SERVFAIL)
+            returned_scope = 0
+            try:
+                upstream_response = dns.message.from_wire(response)
+                for option in upstream_response.options:
+                    if isinstance(option, dns.edns.ECSOption):
+                        returned_scope = option.scopelen
+                        break
+                    if option.otype == dns.edns.ECS and len(getattr(option, "data", b"")) >= 4:
+                        returned_scope = option.data[3]
+                        break
+            except Exception:
+                pass
+
+            if not do_flag:
+                response = self._strip_dnssec_records(
+                    response, msg.question[0].name, qtype
+                )
+            response = self._normalize_response_edns(response, msg, do_flag)
 
             # 12. Rebind protection
             if self.rebind_protection_enabled:
@@ -2751,7 +2869,7 @@ class DNSResolver:
                 if ttl is None:
                     ttl = self.negative_cache_ttl
                 await self._negative_cache_set(cache_key, response, ttl=ttl)
-            else:
+            elif dns.message.from_wire(response).rcode() == dns.rcode.NOERROR:
                 try:
                     resp_msg = dns.message.from_wire(response)
                     min_ttl = min(
@@ -2759,19 +2877,11 @@ class DNSResolver:
                         for rr in sec if rr.rdtype != dns.rdatatype.OPT),
                         default=300
                     )
-                    returned_scope = 0
-                    for opt in resp_msg.options:
-                        if opt.otype == 8 and len(opt.data) >= 4:
-                            returned_scope = opt.data[3]
-                            break
-                    if returned_scope > 0 and client_ip:
-                        final_key = (qname.lower(), qtype, f"{client_ip}/{returned_scope}")
-                    else:
-                        final_key = (qname.lower(), qtype, "global")
+                    final_key = global_cache_key if returned_scope == 0 else cache_key
                     if min_ttl > 0:
                         expiry = time.time() + min_ttl
                         stale_until = expiry + self.stale_max_age if self.optimistic_cache_enabled else expiry
-                        val = (response, expiry, forward_data, stale_until, False)
+                        val = (response, expiry, forward_data, stale_until, validate_dnssec)
                         await self._wire_cache_set(final_key, val)
                 except Exception as e:
                     self.logger.debug("Cache set error: %s", e)
@@ -2968,9 +3078,12 @@ class DNSResolver:
                 await self._negative_cache_set(key, resp, ttl=ttl)
             return self._set_query_id(resp, orig_id)
 
+        if dns.message.from_wire(resp).rcode() != dns.rcode.NOERROR:
+            return self._set_query_id(resp, orig_id)
+
         ttl = self._extract_min_ttl(resp)
         if ttl <= 0:
-            ttl = 30
+            return self._set_query_id(resp, orig_id)
         expiry = time.time() + ttl
         stale_until = expiry + self.stale_max_age if self.optimistic_cache_enabled else expiry
         val = (resp, expiry, data, stale_until, dnssec_ok)
@@ -3114,6 +3227,7 @@ class DNSResolver:
                 raise Exception("IPv6 disabled but resolved to IPv6")
             reader, writer = await asyncio.open_connection(resolved, int(port))
 
+        reusable = False
         try:
             writer.write(len(data).to_bytes(2, "big") + data)
             await writer.drain()
@@ -3139,14 +3253,15 @@ class DNSResolver:
 
             self._validate_response_question(data, resp, "TCP")
             await self._tcp_pool.put(key, reader, writer)
+            reusable = True
             return resp
-        except Exception:
-            if pooled:
+        finally:
+            if not reusable:
                 try:
                     writer.close()
-                except Exception:
+                    await writer.wait_closed()
+                except (Exception, asyncio.CancelledError):
                     pass
-            raise
 
     async def _forward_tls(self, data: bytes, upstream: Dict[str, Any]) -> bytes:
         host = upstream['address']
@@ -3836,14 +3951,18 @@ class DNSResolver:
         except ValueError:
             return False
 
-    def _set_tc_bit(self, response_bytes: bytes) -> bytes:
-        if len(response_bytes) < 4:
-            return response_bytes
-        header = bytearray(response_bytes)
-        flags = int.from_bytes(header[2:4], 'big')
-        flags |= 0x0200
-        header[2:4] = flags.to_bytes(2, 'big')
-        return bytes(header)
+    def _set_tc_bit(self, response_bytes: bytes, max_size: int = 512) -> bytes:
+        try:
+            message = dns.message.from_wire(response_bytes)
+            message.flags |= dns.flags.TC
+            return message.to_wire(max_size=max_size, prefer_truncation=True)
+        except Exception:
+            if len(response_bytes) < 4:
+                return response_bytes
+            header = bytearray(response_bytes)
+            flags = int.from_bytes(header[2:4], 'big') | 0x0200
+            header[2:4] = flags.to_bytes(2, 'big')
+            return bytes(header)
 
     async def _with_retries(self, fn: Callable[[bytes], Coroutine[Any, Any, bytes]], data: bytes, timeout: float, no_retry: bool = False) -> bytes:
         if no_retry:
@@ -4136,16 +4255,6 @@ class DNSResolver:
                     self._load_trust_anchors()
             if auto_update_trust_anchor is not None:
                 self.auto_update_trust_anchor = auto_update_trust_anchor
-                if self.auto_update_trust_anchor and self._trust_anchor_updater_task is None:
-                    self._trust_anchor_updater_task = asyncio.create_task(self._background_trust_anchor_updater())
-                    self._background_tasks.add(self._trust_anchor_updater_task)
-                elif not self.auto_update_trust_anchor and self._trust_anchor_updater_task is not None:
-                    self._trust_anchor_updater_task.cancel()
-                    try:
-                        await self._trust_anchor_updater_task
-                    except asyncio.CancelledError:
-                        pass
-                    self._trust_anchor_updater_task = None
             if dnssec_max_validations is not None:
                 self.dnssec_max_validations = dnssec_max_validations
             if dnssec_max_dnskey_records is not None:
@@ -4238,6 +4347,30 @@ class DNSResolver:
                     except asyncio.CancelledError:
                         pass
                     self._health_task = None
+
+            if self._started and self.dnssec_enabled:
+                if self._insecure_cleanup_task is None or self._insecure_cleanup_task.done():
+                    self._insecure_cleanup_task = asyncio.create_task(self._cleanup_insecure_cache())
+                    self._background_tasks.add(self._insecure_cleanup_task)
+                if self.auto_update_trust_anchor and (
+                    self._trust_anchor_updater_task is None
+                    or self._trust_anchor_updater_task.done()
+                ):
+                    self._trust_anchor_updater_task = asyncio.create_task(
+                        self._background_trust_anchor_updater()
+                    )
+                    self._background_tasks.add(self._trust_anchor_updater_task)
+            else:
+                for task_name in ("_insecure_cleanup_task", "_trust_anchor_updater_task"):
+                    task = getattr(self, task_name)
+                    if task is not None:
+                        task.cancel()
+                        try:
+                            await task
+                        except asyncio.CancelledError:
+                            pass
+                        self._background_tasks.discard(task)
+                        setattr(self, task_name, None)
 
             self.logger.info("DNSResolver configuration updated: "
                              "disable_ipv6=%s, strip_ipv6_records=%s, verbose=%s, rate_limit=%s/%s, optimistic_cache=%s, "

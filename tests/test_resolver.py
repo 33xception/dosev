@@ -73,6 +73,19 @@ def make_rrsig(covered_type: int, name: str) -> dns.rrset.RRset:
     return dns.rrset.from_text(name, 300, dns.rdataclass.IN, dns.rdatatype.RRSIG, rrsig_text)
 
 
+@pytest.mark.asyncio
+async def test_async_ttl_cache_updates_and_evicts_in_constant_order():
+    cache = AsyncTTLCache(maxsize=2, ttl=60)
+    await cache.set("first", 1)
+    await cache.set("second", 2)
+    await cache.set("first", 10)
+    await cache.set("third", 3)
+
+    assert await cache.get("first") == 10
+    assert await cache.get("second") is None
+    assert await cache.get("third") == 3
+
+
 # ---------- Basic Resolver Tests ----------
 @pytest.mark.asyncio
 async def test_is_blocked_exact_and_suffix():
@@ -169,6 +182,31 @@ async def test_forward_dns_query_negative_responses_are_cached(monkeypatch):
 
 
 @pytest.mark.asyncio
+async def test_forward_dns_query_does_not_cache_servfail(monkeypatch):
+    resolver = DNSResolver(
+        upstreams=[{"address": "1.1.1.1", "protocol": "udp", "ip": "1.1.1.1"}]
+    )
+    query = dns.message.make_query("temporary-failure.example", "A").to_wire()
+    calls = 0
+
+    async def failing_upstream(upstream, data):
+        nonlocal calls
+        calls += 1
+        response = dns.message.make_response(dns.message.from_wire(data))
+        response.set_rcode(dns.rcode.SERVFAIL)
+        return response.to_wire()
+
+    monkeypatch.setattr(resolver, "_try_upstream", failing_upstream)
+
+    first = await resolver.forward_dns_query(query)
+    second = await resolver.forward_dns_query(query)
+
+    assert calls == 2
+    assert dns.message.from_wire(first).rcode() == dns.rcode.SERVFAIL
+    assert dns.message.from_wire(second).rcode() == dns.rcode.SERVFAIL
+
+
+@pytest.mark.asyncio
 async def test_forward_dns_query_cache_expires(monkeypatch):
     resolver = DNSResolver(
         upstreams=[{"address": "1.1.1.1", "protocol": "udp", "ip": "1.1.1.1"}],
@@ -188,6 +226,40 @@ async def test_forward_dns_query_cache_expires(monkeypatch):
     await asyncio.sleep(1.1)
     response3 = await resolver.forward_dns_query(query)
     assert response3 == response1
+
+
+@pytest.mark.asyncio
+async def test_cached_answer_uses_remaining_ttl_and_client_edns(monkeypatch):
+    resolver = DNSResolver(
+        upstreams=[{"address": "1.1.1.1", "protocol": "udp", "ip": "1.1.1.1"}]
+    )
+    calls = 0
+
+    async def fake_upstream(upstream, data):
+        nonlocal calls
+        calls += 1
+        response = dns.message.make_response(dns.message.from_wire(data))
+        response.answer.append(dns.rrset.from_text(
+            "example.com.", 300, dns.rdataclass.IN, dns.rdatatype.A, "192.0.2.1"
+        ))
+        response.use_edns(payload=4096, ednsflags=dns.flags.DO)
+        return response.to_wire()
+
+    monkeypatch.setattr(resolver, "_try_upstream", fake_upstream)
+    query = dns.message.make_query("example.com", "A")
+    first = await resolver.forward_dns_query(query.to_wire())
+    assert dns.message.from_wire(first).edns == -1
+
+    edns_query = dns.message.make_query("example.com", "A")
+    edns_query.use_edns(payload=1232)
+    second = await resolver.forward_dns_query(edns_query.to_wire())
+    cached = dns.message.from_wire(second)
+
+    assert calls == 1
+    assert cached.opt is not None
+    assert cached.payload == 1232
+    assert not (cached.ednsflags & dns.flags.DO)
+    assert cached.answer[0].ttl < 300
 
 
 @pytest.mark.asyncio
@@ -312,6 +384,35 @@ async def test_dnssec_unsigned_domain_is_insecure(resolver):
     secure, insecure = await resolver._dnssec_validate(qname, wire, dnssec_requested=True)
     assert secure is False
     assert insecure is True
+
+
+@pytest.mark.asyncio
+async def test_dnssec_validates_when_client_does_not_set_do(resolver, monkeypatch):
+    resolver.dnssec_enabled = True
+    query = dns.message.make_query("example.com", "A")
+    captured = {}
+
+    async def fake_upstream(upstream, data):
+        forwarded = dns.message.from_wire(data)
+        captured["do"] = bool(forwarded.ednsflags & dns.flags.DO)
+        response = dns.message.make_response(forwarded)
+        response.answer.append(dns.rrset.from_text(
+            "example.com.", 60, dns.rdataclass.IN, dns.rdatatype.A, "192.0.2.1"
+        ))
+        response.answer.append(make_rrsig(dns.rdatatype.A, "example.com"))
+        return response.to_wire()
+
+    monkeypatch.setattr(resolver, "_try_upstream", fake_upstream)
+    validation = AsyncMock(return_value=(True, False))
+    monkeypatch.setattr(resolver, "_dnssec_validate", validation)
+
+    response_wire = await resolver.forward_dns_query(query.to_wire())
+    response = dns.message.from_wire(response_wire)
+
+    assert captured["do"] is True
+    validation.assert_awaited_once()
+    assert response.edns == -1
+    assert [rrset.rdtype for rrset in response.answer] == [dns.rdatatype.A]
 
 
 @pytest.mark.asyncio
@@ -603,6 +704,22 @@ async def test_update_config_changes_edns_payload(resolver):
 
 
 @pytest.mark.asyncio
+async def test_dnssec_background_tasks_follow_runtime_config(resolver):
+    await resolver.start()
+    assert resolver._trust_anchor_updater_task is None
+
+    await resolver.update_config(dnssec_enabled=True, auto_update_trust_anchor=False)
+    assert resolver._insecure_cleanup_task is not None
+    assert resolver._trust_anchor_updater_task is None
+
+    cleanup_task = resolver._insecure_cleanup_task
+    await resolver.update_config(dnssec_enabled=False)
+    assert resolver._insecure_cleanup_task is None
+    assert cleanup_task.cancelled()
+    await resolver.shutdown()
+
+
+@pytest.mark.asyncio
 async def test_update_config_changes_rate_limiter(resolver):
     assert resolver.rate_limiter is None
     await resolver.update_config(rate_limit_rps=10.0, rate_limit_burst=5.0)
@@ -711,6 +828,28 @@ async def test_forward_tcp_pool_reuse():
 
         result2 = await resolver._forward_tcp(data, resolver.upstreams[0])
         assert result2 == resp
+
+
+@pytest.mark.asyncio
+async def test_forward_tcp_closes_new_connection_after_timeout(monkeypatch):
+    resolver = DNSResolver(
+        upstreams=[{"address": "127.0.0.1", "protocol": "tcp", "port": 53, "ip": "127.0.0.1"}]
+    )
+    query = dns.message.make_query("example.com", "A").to_wire()
+    reader = MagicMock()
+    reader.readexactly = AsyncMock(side_effect=asyncio.TimeoutError)
+    writer = MagicMock()
+    writer.drain = AsyncMock()
+    writer.wait_closed = AsyncMock()
+    monkeypatch.setattr(resolver._tcp_pool, "get", AsyncMock(return_value=None))
+    monkeypatch.setattr(resolver, "_resolve_upstream_ip", AsyncMock(return_value="127.0.0.1"))
+    monkeypatch.setattr(asyncio, "open_connection", AsyncMock(return_value=(reader, writer)))
+
+    with pytest.raises(asyncio.TimeoutError):
+        await resolver._forward_tcp(query, resolver.upstreams[0])
+
+    writer.close.assert_called_once()
+    writer.wait_closed.assert_awaited_once()
 
 
 @pytest.mark.asyncio
@@ -2324,3 +2463,41 @@ async def test_ecs_scope_cache_isolation():
             break
     else:
         pytest.fail("No matching cache key found")
+
+
+@pytest.mark.asyncio
+async def test_client_subnets_do_not_share_ecs_cached_answers(monkeypatch):
+    resolver = DNSResolver(
+        upstreams=[{"address": "1.1.1.1", "protocol": "udp", "ip": "1.1.1.1"}],
+        ecs_enabled=True,
+    )
+    query = dns.message.make_query("geo.example", "A").to_wire()
+    upstream_subnets = []
+
+    async def fake_upstream(upstream, data):
+        request = dns.message.from_wire(data)
+        ecs = next(option for option in request.options
+                   if isinstance(option, dns.edns.ECSOption))
+        upstream_subnets.append((ecs.address, ecs.srclen))
+        response = dns.message.make_response(request)
+        answer_ip = "192.0.2.1" if ecs.address == "198.51.100.0" else "192.0.2.2"
+        response.answer.append(dns.rrset.from_text(
+            "geo.example.", 60, dns.rdataclass.IN, dns.rdatatype.A, answer_ip
+        ))
+        response.use_edns(options=[dns.edns.ECSOption(
+            address=ecs.address, srclen=ecs.srclen, scopelen=ecs.srclen
+        )])
+        return response.to_wire()
+
+    monkeypatch.setattr(resolver, "_try_upstream", fake_upstream)
+
+    first = await resolver.forward_dns_query(
+        query, client_ip="198.51.100.10", rate_limit_checked=True
+    )
+    second = await resolver.forward_dns_query(
+        query, client_ip="198.51.101.10", rate_limit_checked=True
+    )
+
+    assert upstream_subnets == [("198.51.100.0", 24), ("198.51.101.0", 24)]
+    assert dns.message.from_wire(first).answer[0][0].address == "192.0.2.1"
+    assert dns.message.from_wire(second).answer[0][0].address == "192.0.2.2"

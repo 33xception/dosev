@@ -8,6 +8,7 @@ import pytest
 from unittest.mock import AsyncMock, MagicMock, patch
 
 import dns.message
+from aioquic.h3.events import DataReceived, HeadersReceived
 
 from dosev.resolver import ConnectionPool, ClientPool, DNSResolver
 from dosev.server import Http3ServerProtocol, ResolverHolder
@@ -219,6 +220,49 @@ async def test_http3_protocol_handles_post_request():
         status, body, content_type = send_responses[0]
         assert status == 200
         assert content_type == "application/dns-message"
+
+
+@pytest.mark.asyncio
+async def test_http3_dispatches_get_when_headers_end_stream():
+    resolver = DNSResolver()
+    holder = ResolverHolder(resolver)
+    query = dns.message.make_query("example.com", "A").to_wire()
+    encoded_query = base64.urlsafe_b64encode(query).decode()
+    headers = [
+        (b":method", b"GET"),
+        (b":path", f"/dns-query?dns={encoded_query}".encode()),
+        (b"content-type", b"application/dns-message"),
+    ]
+    event = HeadersReceived(headers=headers, stream_id=0, stream_ended=True)
+    protocol = Http3ServerProtocol(quic=MagicMock())
+    protocol.set_holder(holder)
+    protocol._client_ip = "192.0.2.10"
+    protocol._http.handle_event = MagicMock(return_value=[event])
+    protocol._send_response = AsyncMock()
+
+    with patch.object(resolver, "forward_dns_query", new=AsyncMock(return_value=b"response")) as forward:
+        protocol.quic_event_received(MagicMock())
+        await asyncio.gather(*protocol._request_tasks.values())
+
+    forward.assert_awaited_once_with(
+        query, client_ip="192.0.2.10", rate_limit_checked=True
+    )
+    protocol._send_response.assert_awaited_once()
+
+
+@pytest.mark.asyncio
+async def test_http3_rejects_dns_bodies_over_wire_limit():
+    protocol = Http3ServerProtocol(quic=MagicMock())
+    protocol._http.handle_event = MagicMock(return_value=[
+        DataReceived(stream_id=0, data=b"x" * 65536, stream_ended=True, push_id=None)
+    ])
+    protocol._send_response_now = MagicMock()
+
+    protocol.quic_event_received(MagicMock())
+
+    protocol._send_response_now.assert_called_once_with(
+        0, 413, b"DNS message too large"
+    )
 
 
 # ---------- DoQ tests ----------

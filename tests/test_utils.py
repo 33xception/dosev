@@ -106,3 +106,42 @@ async def test_fetch_blocklists_skips_non_200_and_handles_errors(monkeypatch, tm
 
     assert (destination / "good").exists()
     assert not (destination / "bad").exists()
+
+
+@pytest.mark.asyncio
+async def test_failed_blocklist_download_preserves_existing_file(monkeypatch, tmp_path):
+    destination = tmp_path / "blocklists"
+    destination.mkdir()
+    existing = destination / "list.txt"
+    existing.write_text("previous list", encoding="utf-8")
+
+    class BrokenStream:
+        async def iter_chunked(self, size):
+            yield b"partial"
+            raise RuntimeError("interrupted")
+
+    class Response:
+        status = 200
+        content = BrokenStream()
+
+        async def __aenter__(self):
+            return self
+
+        async def __aexit__(self, exc_type, exc, tb):
+            return False
+
+    class Session:
+        async def __aenter__(self):
+            return self
+
+        async def __aexit__(self, exc_type, exc, tb):
+            return False
+
+        def get(self, url):
+            return Response()
+
+    monkeypatch.setattr(aiohttp, "ClientSession", Session)
+    await fetch_blocklists(["https://example.com/list.txt?token=value"], str(destination))
+
+    assert existing.read_text(encoding="utf-8") == "previous list"
+    assert sorted(path.name for path in destination.iterdir()) == ["list.txt"]

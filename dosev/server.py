@@ -13,6 +13,12 @@ from typing import Dict, Set, Tuple, Optional, Any, List
 from aiohttp import web
 
 _DEFAULT_LOG_DIR = os.path.join(os.getenv('LOCALAPPDATA') or os.path.expanduser('~'), 'dosev', 'logs') if os.name == 'nt' else '/var/log/dosev'
+MAX_PENDING_UDP_QUERIES = 1024
+MAX_ACTIVE_TCP_CONNECTIONS = 1024
+MAX_ACTIVE_DOH_REQUESTS = 1024
+MAX_ACTIVE_HTTP3_REQUESTS = 1024
+MAX_HTTP3_ACTIVE_REQUESTS = 128
+MAX_HTTP3_DNS_BODY = 65535
 
 from .resolver import DNSResolver, RateLimiter, MAX_UDP_PAYLOAD
 from .utils import fetch_blocklists
@@ -36,20 +42,38 @@ from aioquic.quic.events import QuicEvent
 class ResolverHolder:
     def __init__(self, resolver: DNSResolver) -> None:
         self.resolver: DNSResolver = resolver
+        self.tcp_tasks: Set[asyncio.Task] = set()
+        self.doh_tasks: Set[asyncio.Task] = set()
+        self.http3_tasks: Set[asyncio.Task] = set()
+        self.http3_protocols: Set[Any] = set()
 
 
 class UDPResolverProtocol(asyncio.DatagramProtocol):
     def __init__(self, holder: ResolverHolder) -> None:
         self.holder: ResolverHolder = holder
         self.transport: Optional[asyncio.DatagramTransport] = None
+        self._tasks: Set[asyncio.Task] = set()
 
     def connection_made(self, transport: asyncio.DatagramTransport) -> None:
         self.transport = transport
         logging.debug("UDP listener started")
 
     def datagram_received(self, data: bytes, addr: Tuple[str, int]) -> None:
+        if len(self._tasks) >= MAX_PENDING_UDP_QUERIES:
+            logging.warning("Dropping UDP DNS query because the handler limit is full")
+            return
         logging.debug(f"Received UDP DNS query from {addr}")
-        asyncio.create_task(self._handle(data, addr))
+        task = asyncio.create_task(self._handle(data, addr))
+        self._tasks.add(task)
+        task.add_done_callback(self._tasks.discard)
+
+    async def shutdown(self) -> None:
+        tasks = list(self._tasks)
+        for task in tasks:
+            task.cancel()
+        if tasks:
+            await asyncio.gather(*tasks, return_exceptions=True)
+        self._tasks.clear()
 
     async def _handle(self, data: bytes, addr: Tuple[str, int]) -> None:
         resolver = self.holder.resolver
@@ -94,7 +118,9 @@ class UDPResolverProtocol(asyncio.DatagramProtocol):
                     pass
                 return
 
-            response = await resolver.forward_dns_query(data)
+            response = await resolver.forward_dns_query(
+                data, client_ip=client_ip, rate_limit_checked=True
+            )
 
             client_payload = 512
             try:
@@ -104,7 +130,7 @@ class UDPResolverProtocol(asyncio.DatagramProtocol):
             except Exception:
                 pass
             if len(response) > client_payload:
-                response = resolver._set_tc_bit(response)
+                response = resolver._set_tc_bit(response, client_payload)
 
             if resolver.strip_ipv6_records:
                 response = resolver._strip_ipv6_records(response)
@@ -122,74 +148,77 @@ class UDPResolverProtocol(asyncio.DatagramProtocol):
 
 async def _tcp_handler(reader: asyncio.StreamReader, writer: asyncio.StreamWriter,
                        holder: ResolverHolder) -> None:
+    if len(holder.tcp_tasks) >= MAX_ACTIVE_TCP_CONNECTIONS:
+        writer.close()
+        try:
+            await writer.wait_closed()
+        except Exception:
+            pass
+        return
     peer = writer.get_extra_info('peername')
     logging.debug(f"Accepted TCP connection from {peer}")
     resolver = holder.resolver
     client_ip = peer[0] if peer else "unknown"
-
-    if not await resolver._check_rate_limit(client_ip):
-        logging.debug("Rate‑limited TCP query from %s", client_ip)
-        writer.close()
-        return
-
+    handler_task = asyncio.current_task()
+    if handler_task is not None:
+        holder.tcp_tasks.add(handler_task)
     try:
-        try:
-            length_bytes = await asyncio.wait_for(reader.readexactly(2), timeout=30.0)
-            length = int.from_bytes(length_bytes, 'big')
-            data = await asyncio.wait_for(reader.readexactly(length), timeout=30.0)
-        except asyncio.TimeoutError:
-            logging.debug("TCP read timeout from %s", peer)
-            writer.close()
-            return
-
-        qname: Optional[str] = None
-        request_msg: Optional[dns.message.Message] = None
-        qtype: Optional[int] = None
-        try:
-            request_msg = dns.message.from_wire(data)
-            if request_msg.question:
-                qname = str(request_msg.question[0].name).rstrip('.')
-                qtype = request_msg.question[0].rdtype
-        except Exception:
-            qname = None
-
-        if resolver.disable_ipv6 and qtype == dns.rdatatype.AAAA:
-            resp_wire = resolver.build_block_response(data, action='NXDOMAIN')
-            writer.write(len(resp_wire).to_bytes(2, 'big') + resp_wire)
-            await writer.drain()
-            logging.debug(f"Blocked AAAA query for {qname} due to disable_ipv6")
+        while True:
             try:
-                resolver.log_dns_event('Blocked (internal)', qname, f"{peer[0]}:{peer[1]}", 'Disabled IPv6')
+                length_bytes = await asyncio.wait_for(reader.readexactly(2), timeout=30.0)
+                length = int.from_bytes(length_bytes, 'big')
+                if length < 12:
+                    logging.debug("Invalid TCP DNS message length %d from %s", length, peer)
+                    break
+                data = await asyncio.wait_for(reader.readexactly(length), timeout=30.0)
+            except asyncio.IncompleteReadError:
+                break
+            except asyncio.TimeoutError:
+                logging.debug("TCP read timeout from %s", peer)
+                break
+
+            if not await resolver._check_rate_limit(client_ip):
+                logging.debug("Rate-limited TCP query from %s", client_ip)
+                break
+
+            qname: Optional[str] = None
+            qtype: Optional[int] = None
+            try:
+                request_msg = dns.message.from_wire(data)
+                if request_msg.question:
+                    qname = str(request_msg.question[0].name).rstrip('.')
+                    qtype = request_msg.question[0].rdtype
             except Exception:
                 pass
-            return
 
-        if qname and await resolver.is_blocked(qname):
-            action = resolver.get_block_action()
-            resp_wire = resolver.build_block_response(data, action=action)
-            writer.write(len(resp_wire).to_bytes(2, 'big') + resp_wire)
+            client_address = f"{client_ip}:{peer[1]}" if peer else client_ip
+            if resolver.disable_ipv6 and qtype == dns.rdatatype.AAAA:
+                response = resolver.build_block_response(data, action='NXDOMAIN')
+                try:
+                    resolver.log_dns_event('Blocked (internal)', qname, client_address, 'Disabled IPv6')
+                except Exception:
+                    pass
+            elif qname and await resolver.is_blocked(qname):
+                action = resolver.get_block_action()
+                response = resolver.build_block_response(data, action=action)
+                try:
+                    resolver.log_dns_event('Blocked (internal)', qname, client_address, f"Action={action}")
+                except Exception:
+                    pass
+            else:
+                response = await resolver.forward_dns_query(
+                    data, client_ip=client_ip, rate_limit_checked=True
+                )
+                if resolver.strip_ipv6_records:
+                    response = resolver._strip_ipv6_records(response)
+                try:
+                    resolver.log_dns_event('Processed', qname, client_address)
+                except Exception:
+                    pass
+
+            writer.write(len(response).to_bytes(2, 'big') + response)
             await writer.drain()
-            logging.debug(f"Blocked TCP DNS query for {qname} -> action {action}")
-            try:
-                resolver.log_dns_event('Blocked (internal)', qname, f"{peer[0]}:{peer[1]}", f"Action={action}")
-            except Exception:
-                pass
-            return
-
-        response = await resolver.forward_dns_query(data)
-
-        if resolver.strip_ipv6_records:
-            response = resolver._strip_ipv6_records(response)
-
-        try:
-            resolver.log_dns_event('Processed', qname, f"{peer[0]}:{peer[1]}")
-        except Exception:
-            pass
-
-        resp_len = len(response).to_bytes(2, 'big')
-        writer.write(resp_len + response)
-        await writer.drain()
-        logging.debug(f"Sent TCP DNS response to {peer}")
+            logging.debug("Sent TCP DNS response to %s", peer)
     except Exception as e:
         logging.error(f"Error handling TCP DNS query from {peer}: {e}")
     finally:
@@ -198,6 +227,8 @@ async def _tcp_handler(reader: asyncio.StreamReader, writer: asyncio.StreamWrite
             await writer.wait_closed()
         except Exception:
             pass
+        if handler_task is not None:
+            holder.tcp_tasks.discard(handler_task)
 
 
 async def reload_resolver(holder: ResolverHolder,
@@ -289,12 +320,9 @@ def _drop_dns_privileges(user: str, group: Optional[str] = None,
                 logging.warning('chroot failed: %s', e)
                 raise
         try:
+            os.setgroups([])
             os.setgid(gid)
             os.setuid(pw.pw_uid)
-            try:
-                os.setgroups([])
-            except Exception:
-                logging.debug('Failed to set supplementary groups during drop_privileges', exc_info=True)
         except Exception as e:
             logging.warning('Failed to drop privileges: %s', e)
             raise
@@ -370,7 +398,9 @@ async def _handle_doh_request(request: web.Request, holder: ResolverHolder) -> w
                 pass
             return web.Response(body=resp_wire, content_type='application/dns-message')
 
-        response = await resolver.forward_dns_query(raw_query)
+        response = await resolver.forward_dns_query(
+            raw_query, client_ip=client_ip, rate_limit_checked=True
+        )
         if resolver.strip_ipv6_records:
             response = resolver._strip_ipv6_records(response)
 
@@ -390,7 +420,23 @@ async def _start_doh_server(holder: ResolverHolder, listen_ip: str, listen_port:
                             doh_path: str, ssl_context: ssl.SSLContext) -> web.AppRunner:
     if not doh_path.startswith('/'):
         doh_path = '/' + doh_path
-    app = web.Application()
+    @web.middleware
+    async def limit_doh_requests(request: web.Request, handler):
+        if len(holder.doh_tasks) >= MAX_ACTIVE_DOH_REQUESTS:
+            return web.Response(status=503, text='Server Busy')
+        task = asyncio.current_task()
+        if task is not None:
+            holder.doh_tasks.add(task)
+        try:
+            return await handler(request)
+        finally:
+            if task is not None:
+                holder.doh_tasks.discard(task)
+
+    app = web.Application(
+        middlewares=[limit_doh_requests],
+        client_max_size=MAX_HTTP3_DNS_BODY,
+    )
     app.router.add_route('*', doh_path, lambda request: _handle_doh_request(request, holder))
     runner = web.AppRunner(app)
     await runner.setup()
@@ -406,11 +452,31 @@ class Http3ServerProtocol(QuicConnectionProtocol):
         self._http = H3Connection(self._quic)
         self._request_data: Dict[int, bytearray] = {}
         self._request_headers: Dict[int, dict] = {}
+        self._request_tasks: Dict[int, asyncio.Task] = {}
+        self._rejected_streams: Set[int] = set()
         self._holder: Optional[ResolverHolder] = None
         self._client_ip: str = "unknown"
 
     def set_holder(self, holder: ResolverHolder) -> None:
         self._holder = holder
+
+    def connection_lost(self, exc) -> None:
+        for task in self._request_tasks.values():
+            task.cancel()
+        if self._holder is not None:
+            self._holder.http3_protocols.discard(self)
+        super().connection_lost(exc)
+
+    async def shutdown(self) -> None:
+        tasks = list(self._request_tasks.values())
+        for task in tasks:
+            task.cancel()
+        if tasks:
+            await asyncio.gather(*tasks, return_exceptions=True)
+        self._request_tasks.clear()
+        self._request_data.clear()
+        self._request_headers.clear()
+        self._rejected_streams.clear()
 
     def datagram_received(self, data: bytes, addr) -> None:
         if addr and isinstance(addr, tuple):
@@ -422,14 +488,56 @@ class Http3ServerProtocol(QuicConnectionProtocol):
     def quic_event_received(self, event: QuicEvent) -> None:
         for http_event in self._http.handle_event(event):
             if isinstance(http_event, HeadersReceived):
+                if (http_event.stream_id not in self._request_headers
+                        and len(self._request_headers) + len(self._request_tasks)
+                        >= MAX_HTTP3_ACTIVE_REQUESTS):
+                    self._send_response_now(http_event.stream_id, 503, b"Server Busy")
+                    if not http_event.stream_ended:
+                        self._rejected_streams.add(http_event.stream_id)
+                    continue
                 headers = {k.decode(): v.decode() for k, v in http_event.headers}
                 self._request_headers[http_event.stream_id] = headers
+                if http_event.stream_ended:
+                    self._schedule_request(http_event.stream_id)
             elif isinstance(http_event, DataReceived):
+                if http_event.stream_id in self._rejected_streams:
+                    if http_event.stream_ended:
+                        self._rejected_streams.discard(http_event.stream_id)
+                    continue
                 if http_event.stream_id not in self._request_data:
                     self._request_data[http_event.stream_id] = bytearray()
+                if len(self._request_data[http_event.stream_id]) + len(http_event.data) > MAX_HTTP3_DNS_BODY:
+                    self._request_data.pop(http_event.stream_id, None)
+                    self._request_headers.pop(http_event.stream_id, None)
+                    self._send_response_now(http_event.stream_id, 413, b"DNS message too large")
+                    if not http_event.stream_ended:
+                        self._rejected_streams.add(http_event.stream_id)
+                    continue
                 self._request_data[http_event.stream_id].extend(http_event.data)
                 if http_event.stream_ended:
-                    asyncio.create_task(self._handle_request(http_event.stream_id))
+                    self._schedule_request(http_event.stream_id)
+
+    def _schedule_request(self, stream_id: int) -> None:
+        if stream_id in self._request_tasks:
+            return
+        if self._holder is not None and len(self._holder.http3_tasks) >= MAX_ACTIVE_HTTP3_REQUESTS:
+            self._request_headers.pop(stream_id, None)
+            self._request_data.pop(stream_id, None)
+            self._send_response_now(stream_id, 503, b"Server Busy")
+            return
+        task = asyncio.create_task(self._handle_request(stream_id))
+        self._request_tasks[stream_id] = task
+        if self._holder is not None:
+            self._holder.http3_tasks.add(task)
+
+        def finish(completed: asyncio.Task) -> None:
+            self._request_tasks.pop(stream_id, None)
+            if self._holder is not None:
+                self._holder.http3_tasks.discard(completed)
+            if not completed.cancelled() and completed.exception() is not None:
+                logging.error("HTTP/3 request task failed", exc_info=completed.exception())
+
+        task.add_done_callback(finish)
 
     async def _handle_request(self, stream_id: int):
         headers = self._request_headers.get(stream_id, {})
@@ -474,7 +582,9 @@ class Http3ServerProtocol(QuicConnectionProtocol):
             return
 
         try:
-            response = await resolver.forward_dns_query(raw_query)
+            response = await resolver.forward_dns_query(
+                raw_query, client_ip=client_ip, rate_limit_checked=True
+            )
             if resolver.strip_ipv6_records:
                 response = resolver._strip_ipv6_records(response)
             await self._send_response(stream_id, 200, response, content_type="application/dns-message")
@@ -483,6 +593,10 @@ class Http3ServerProtocol(QuicConnectionProtocol):
             await self._send_response(stream_id, 500, b"Internal Server Error")
 
     async def _send_response(self, stream_id: int, status: int, body: bytes, content_type: str = "text/plain"):
+        self._send_response_now(stream_id, status, body, content_type)
+
+    def _send_response_now(self, stream_id: int, status: int, body: bytes,
+                           content_type: str = "text/plain") -> None:
         headers = [
             (b":status", str(status).encode()),
             (b"content-type", content_type.encode()),
@@ -516,6 +630,7 @@ async def _start_http3_server(holder: ResolverHolder, listen_ip: str, listen_por
     def create_protocol(*args, **kwargs):
         proto = Http3ServerProtocol(*args, **kwargs)
         proto.set_holder(holder)
+        holder.http3_protocols.add(proto)
         return proto
 
     await serve(host=listen_ip, port=listen_port, configuration=config,
@@ -680,10 +795,12 @@ async def run_server(listen_ip: str, listen_port: int,
                     logging.debug("Blocklists reloaded")
                 except Exception as e:
                     logging.warning("Periodic blocklist reload failed: %s", e)
-        loop.create_task(periodic_reload())
+        periodic_reload_task = loop.create_task(periodic_reload())
         logging.info("Scheduled periodic blocklist refresh every %s seconds", interval)
+    else:
+        periodic_reload_task = None
 
-    udp_transport, _ = await loop.create_datagram_endpoint(
+    udp_transport, udp_protocol = await loop.create_datagram_endpoint(
         lambda: UDPResolverProtocol(holder),
         local_addr=(listen_ip, listen_port)
     )
@@ -753,22 +870,40 @@ async def run_server(listen_ip: str, listen_port: int,
         if not shutdown_task.done():
             shutdown_task.cancel()
         logging.info("Shutting down gracefully...")
-        await resolver.stop_pool_cleanups()
-        await resolver.stop_background_tasks()
+        if periodic_reload_task is not None:
+            periodic_reload_task.cancel()
+            await asyncio.gather(periodic_reload_task, return_exceptions=True)
         udp_transport.close()
+        if udp_protocol is not None:
+            await udp_protocol.shutdown()
         if dot_server is not None:
             dot_server.close()
             await dot_server.wait_closed()
-        if doh_runner is not None:
-            await doh_runner.cleanup()
-        if http3_task is not None:
-            http3_task.cancel()
-            try:
-                await http3_task
-            except asyncio.CancelledError:
-                pass
         server.close()
         await server.wait_closed()
+        if doh_runner is not None:
+            await doh_runner.cleanup()
+        doh_tasks = list(holder.doh_tasks)
+        for task in doh_tasks:
+            task.cancel()
+        if doh_tasks:
+            await asyncio.gather(*doh_tasks, return_exceptions=True)
+        tcp_tasks = list(holder.tcp_tasks)
+        for task in tcp_tasks:
+            task.cancel()
+        if tcp_tasks:
+            await asyncio.gather(*tcp_tasks, return_exceptions=True)
+        if http3_task is not None:
+            http3_task.cancel()
+            await asyncio.gather(http3_task, return_exceptions=True)
+        if holder.http3_protocols:
+            await asyncio.gather(
+                *(protocol.shutdown() for protocol in holder.http3_protocols),
+                return_exceptions=True,
+            )
+            holder.http3_protocols.clear()
+        await resolver.shutdown(stop_prometheus=True)
+        await asyncio.gather(serve_task, shutdown_task, return_exceptions=True)
         logging.info("Shutdown complete.")
 
 

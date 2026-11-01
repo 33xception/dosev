@@ -3,7 +3,9 @@
 import asyncio
 import os
 import logging
+import tempfile
 from typing import List
+from urllib.parse import unquote, urlsplit
 
 import aiohttp
 import aiohttp.client_exceptions
@@ -24,19 +26,31 @@ async def fetch_blocklists(urls: List[str], destination_dir: str = "blocklists")
                     if resp.status != 200:
                         logging.warning("Failed to fetch %s: HTTP %s", url, resp.status)
                         continue
-                    filename = url.split('/')[-1] or 'blocklist.txt'
-                    if not filename:
-                        filename = 'blocklist.txt'
+                    filename = os.path.basename(unquote(urlsplit(url).path)) or 'blocklist.txt'
                     filepath = os.path.join(destination_dir, filename)
-                    with open(filepath, 'w', encoding='utf-8') as f:
-                        if hasattr(resp.content, 'iter_chunked'):
-                            async for chunk in resp.content.iter_chunked(8192):
-                                if chunk:
-                                    f.write(chunk.decode('utf-8', errors='ignore'))
-                        else:
-                            async for chunk, _ in resp.content.iter_chunks():
-                                if chunk:
-                                    f.write(chunk.decode('utf-8', errors='ignore'))
+                    file_descriptor, temporary_path = tempfile.mkstemp(
+                        dir=destination_dir, prefix=f'.{filename}.', suffix='.tmp'
+                    )
+                    try:
+                        with os.fdopen(file_descriptor, 'w', encoding='utf-8') as f:
+                            content = getattr(resp, 'content', None)
+                            if content is None and hasattr(resp, 'text'):
+                                await asyncio.to_thread(f.write, await resp.text())
+                            elif hasattr(content, 'iter_chunked'):
+                                async for chunk in content.iter_chunked(65536):
+                                    if chunk:
+                                        text = chunk.decode('utf-8', errors='ignore')
+                                        await asyncio.to_thread(f.write, text)
+                            else:
+                                async for chunk, _ in content.iter_chunks():
+                                    if chunk:
+                                        text = chunk.decode('utf-8', errors='ignore')
+                                        await asyncio.to_thread(f.write, text)
+                        os.replace(temporary_path, filepath)
+                        temporary_path = ''
+                    finally:
+                        if temporary_path and os.path.exists(temporary_path):
+                            os.remove(temporary_path)
                     logging.debug("Saved blocklist %s -> %s", url, filepath)
             except asyncio.TimeoutError:
                 logging.warning("Timeout fetching %s", url)
