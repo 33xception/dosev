@@ -681,7 +681,8 @@ class DNSResolver:
                 self._metrics = {
                     'requests_total': Counter('dosev_dns_requests_total', 'Total DNS upstream requests', ['proto']),
                     'requests_errors': Counter('dosev_dns_request_errors_total', 'Failed DNS upstream requests', ['proto']),
-                    'request_latency_seconds': Histogram('dosev_dns_request_latency_seconds', 'Upstream request latency seconds', ['proto'])
+                    'request_latency_seconds': Histogram('dosev_dns_request_latency_seconds', 'Upstream request latency seconds', ['proto']),
+                    'upstream_handshake_failures_total': Counter('dosev_upstream_handshake_failures_total', 'Total TLS handshake failures', ['upstream', 'reason']),
                 }
                 try:
                     # Use make_wsgi_app for a stoppable server.
@@ -3494,17 +3495,25 @@ class DNSResolver:
                 conn_future = asyncio.open_connection(resolved, int(port), ssl=ssl_ctx, server_hostname=hostname)
                 reader, writer = await asyncio.wait_for(conn_future, timeout=self.tcp_timeout)
                 self.logger.debug("TLS connection established to %s:%s", host, port)
-            except asyncio.TimeoutError:
-                self.logger.error("TLS connection timeout to %s:%s (tcp_timeout=%s)", host, port, self.tcp_timeout)
-                raise
-            except ssl.SSLCertVerificationError as e:
-                self.logger.error("TLS certificate verification failed for %s: %s", hostname, e)
-                raise
-            except ssl.SSLZeroReturnError as e:
-                self.logger.error("TLS connection closed prematurely for %s: %s", hostname, e)
-                raise
-            except OSError as e:
-                self.logger.error("OS error connecting to %s:%s: %s", host, port, e)
+            except Exception as e:
+                # Classify and log TLS handshake errors
+                reason, is_handshake = self._classify_tls_error(e, upstream)
+                
+                # Emit warning (rate-limited)
+                if is_handshake:
+                    self._warn_handshake_failure(upstream, reason)
+                
+                # Increment handshake failure counter if metrics enabled
+                if self.metrics_enabled and self._metrics:
+                    try:
+                        upstream_name = upstream.get('address', 'unknown')
+                        self._metrics['upstream_handshake_failures_total'].labels(
+                            upstream=upstream_name, reason=reason
+                        ).inc()
+                    except Exception:
+                        pass
+                
+                self.logger.error("TLS connection error to %s:%s: %s", host, port, e)
                 raise
 
             ssl_obj = writer.get_extra_info('ssl_object')
@@ -3538,7 +3547,24 @@ class DNSResolver:
             self._validate_response_question(data, resp, "TLS")
             await self._tcp_pool.put(key, reader, writer)
             return resp
-        except Exception:
+        except Exception as e:
+            # Classify and log TLS errors
+            reason, is_handshake = self._classify_tls_error(e, upstream)
+            
+            # Emit warning (rate-limited)
+            if is_handshake:
+                self._warn_handshake_failure(upstream, reason)
+            
+            # Increment handshake failure counter if metrics enabled
+            if self.metrics_enabled and self._metrics:
+                try:
+                    upstream_name = upstream.get('address', 'unknown')
+                    self._metrics['upstream_handshake_failures_total'].labels(
+                        upstream=upstream_name, reason=reason
+                    ).inc()
+                except Exception:
+                    pass
+            
             try:
                 writer.close()
                 await writer.wait_closed()
@@ -4234,6 +4260,107 @@ class DNSResolver:
 
     def log_dns_event(self, status: str, qname: Optional[str], client: Optional[str] = None, details: Optional[str] = None) -> None:
         self._log_event(status, qname, client, details)
+
+    def _classify_tls_error(self, exc: Exception, upstream: Dict[str, Any]) -> Tuple[str, bool]:
+        """
+        Classify a TLS/connection error and return (reason, is_handshake_failure).
+        
+        Returns:
+            reason: A string describing the error category ('timeout', 'refused', 'handshake', 'reset', 'other')
+            is_handshake_failure: True if this appears to be a TLS handshake failure
+        """
+        upstream_name = upstream.get('address', 'unknown')
+        
+        # Check for SSL/TLS specific errors
+        if isinstance(exc, ssl.SSLCertVerificationError):
+            return 'certificate', True
+        elif isinstance(exc, ssl.SSLError):
+            # SSL handshake failures - check if we can access reason attribute
+            if hasattr(exc, 'reason'):
+                if exc.reason == 'CERTIFICATE_VERIFY_FAILED':
+                    return 'certificate', True
+                elif exc.reason == 'SSLV3_ALERT_HANDSHAKE_FAILURE':
+                    return 'handshake', True
+                elif exc.reason == 'SSLV3_ALERT_BAD_CERTIFICATE':
+                    return 'certificate', True
+                elif exc.reason == 'SSLV3_ALERT_UNSUPPORTED_EXTENSION':
+                    return 'handshake', True
+                elif exc.reason == 'SSLV3_ALERT_ILLEGAL_PARAMETER':
+                    return 'handshake', True
+            # For SSLError without reason attribute, check the error string
+            error_str = str(exc).lower()
+            if 'handshake' in error_str:
+                return 'handshake', True
+            elif 'certificate' in error_str or 'cert' in error_str:
+                return 'certificate', True
+            return 'ssl_error', True
+        elif isinstance(exc, ssl.SSLZeroReturnError):
+            return 'connection_closed', True
+        elif isinstance(exc, ConnectionResetError):
+            # Could be a middlebox resetting due to oversized ClientHello
+            return 'reset', True
+        elif isinstance(exc, asyncio.TimeoutError):
+            return 'timeout', False
+        elif isinstance(exc, ConnectionRefusedError):
+            return 'refused', False
+        elif isinstance(exc, OSError):
+            # OSError with specific error codes
+            if hasattr(exc, 'errno'):
+                import errno as errno_module
+                if exc.errno == errno_module.ECONNRESET:
+                    return 'reset', True
+                elif exc.errno == errno_module.ECONNREFUSED:
+                    return 'refused', False
+                elif exc.errno == errno_module.ETIMEDOUT:
+                    return 'timeout', False
+            return 'os_error', False
+        else:
+            # Check error message for handshake-related terms
+            error_str = str(exc).lower()
+            if 'handshake' in error_str or 'ssl' in error_str or 'tls' in error_str:
+                return 'handshake', True
+            return 'other', False
+
+    def _warn_handshake_failure(self, upstream: Dict[str, Any], reason: str) -> None:
+        """
+        Emit a warning for TLS handshake failures, with special guidance for
+        oversized ClientHello issues.
+        
+        Only emits one warning per upstream per interval to avoid log spam.
+        """
+        upstream_name = upstream.get('address', 'unknown')
+        now = time.time()
+        
+        # Use a simple in-memory tracking for warnings (not persisted across restarts)
+        # In production, this would be more sophisticated
+        if not hasattr(self, '_handshake_warnings'):
+            self._handshake_warnings: Dict[str, float] = {}
+        
+        last_warning = self._handshake_warnings.get(upstream_name, 0)
+        warning_interval = 300  # 5 minutes
+        
+        if now - last_warning < warning_interval:
+            return
+        
+        self._handshake_warnings[upstream_name] = now
+        
+        # For reset/handshake errors that might be due to oversized ClientHello,
+        # provide specific guidance. Timeout is NOT a handshake failure.
+        if reason in ('reset', 'handshake'):
+            self.logger.warning(
+                "TLS handshake failure for upstream %s (reason: %s). "
+                "If using OpenSSL < 3.5 or with PQ groups enabled, this may be due to "
+                "a ClientHello that exceeds middlebox limits. "
+                "Workaround: Set OPENSSL_CONF environment variable before starting the process. "
+                "Example: OPENSSL_CONF=/etc/ssl/openssl-pq.cnf dosev",
+                upstream_name, reason
+            )
+        else:
+            # For timeout and other reasons, provide general message
+            self.logger.warning(
+                "TLS connection error for upstream %s (reason: %s)",
+                upstream_name, reason
+            )
 
     async def _check_cert_pins(self, hostname: str, ssl_obj: Any) -> None:
         if not self.pinned_certs:
