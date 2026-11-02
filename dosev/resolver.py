@@ -582,6 +582,7 @@ class DNSResolver:
                   load_balancing: str = 'failover',
                   bootstrap: Optional[Dict[str, Any]] = None,
                   tcp_fallback_enabled: bool = True,
+                  tcp_fastopen_enabled: bool = True,
                   health_config: Optional[Dict[str, Any]] = None) -> None:
 
         self.upstreams: List[Dict[str, Any]] = upstreams or []
@@ -756,6 +757,7 @@ class DNSResolver:
         self._rr_index: int = 0
 
         self.tcp_fallback_enabled: bool = tcp_fallback_enabled
+        self.tcp_fastopen_enabled: bool = bool(tcp_fastopen_enabled)
 
         self._health_config: Dict[str, Any] = health_config or {}
         self._health_enabled: bool = self._health_config.get('enabled', False)
@@ -3225,7 +3227,7 @@ class DNSResolver:
             resolved = await self._resolve_upstream_ip(host, ip_override)
             if self.disable_ipv6 and self._is_ipv6_address(resolved):
                 raise Exception("IPv6 disabled but resolved to IPv6")
-            reader, writer = await asyncio.open_connection(resolved, int(port))
+            reader, writer = await self._open_tcp_connection(resolved, int(port))
 
         reusable = False
         try:
@@ -3262,6 +3264,32 @@ class DNSResolver:
                     await writer.wait_closed()
                 except (Exception, asyncio.CancelledError):
                     pass
+
+    async def _open_tcp_connection(self, host: str, port: int) -> Tuple[asyncio.StreamReader, asyncio.StreamWriter]:
+        fastopen_option = getattr(socket, 'TCP_FASTOPEN_CONNECT', None)
+        if not self.tcp_fastopen_enabled or fastopen_option is None:
+            return await asyncio.open_connection(host, port)
+
+        family = socket.AF_INET6 if self._is_ipv6_address(host) else socket.AF_INET
+        sock = socket.socket(family, socket.SOCK_STREAM)
+        try:
+            try:
+                sock.setsockopt(socket.IPPROTO_TCP, fastopen_option, 1)
+            except OSError:
+                sock.close()
+                return await asyncio.open_connection(host, port)
+
+            sock.settimeout(self.tcp_timeout)
+            try:
+                await asyncio.to_thread(sock.connect, (host, port))
+            except BlockingIOError:
+                sock.close()
+                return await asyncio.open_connection(host, port)
+            sock.setblocking(False)
+            return await asyncio.open_connection(sock=sock)
+        except BaseException:
+            sock.close()
+            raise
 
     async def _forward_tls(self, data: bytes, upstream: Dict[str, Any]) -> bytes:
         host = upstream['address']
@@ -4210,6 +4238,7 @@ class DNSResolver:
                             load_balancing: Optional[str] = None,
                             bootstrap: Optional[Dict[str, Any]] = None,
                             tcp_fallback_enabled: Optional[bool] = None,
+                            tcp_fastopen_enabled: Optional[bool] = None,
                             health_config: Optional[Dict[str, Any]] = None) -> None:
         async with self._config_lock:
             if verbose is not None:
@@ -4328,6 +4357,8 @@ class DNSResolver:
                 self.bootstrap_retries = bootstrap.get('retries', 2)
             if tcp_fallback_enabled is not None:
                 self.tcp_fallback_enabled = tcp_fallback_enabled
+            if tcp_fastopen_enabled is not None:
+                self.tcp_fastopen_enabled = bool(tcp_fastopen_enabled)
             if health_config is not None:
                 self._health_config = health_config
                 self._health_enabled = health_config.get('enabled', False)

@@ -68,6 +68,8 @@ The resolver periodically tests each upstream using a DNS query (default: SOA fo
 #### TCP Fallback
 If an upstream returns a UDP response with the TC (truncation) bit set, the resolver automatically retries the same query over TCP to that upstream, returning the full response.
 
+New plain TCP upstream connections can use RFC 7413 TCP Fast Open (`tcp_fastopen_enabled`, enabled by default) to send the DNS query with the connection's initial data and reduce connection latency. It is best-effort: platforms or kernels without client Fast Open support use ordinary TCP connections. Reused pooled connections do not need Fast Open.
+
 **Key Methods**:
 - `forward_dns_query(data: bytes) -> bytes` – the main entry point for processing a raw DNS query.
 - `_try_upstream(upstream, data) -> bytes` – sends a query to a single upstream, with retries.

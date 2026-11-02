@@ -73,6 +73,7 @@ All upstreams are now defined in the `[upstreams]` section (see below).
 | `doh_auto_cache_ttl` | int | `3600` | Cache TTL for auto-detected DoH versions. |
 | `load_balancing` | string | `failover` | Upstream selection strategy: `failover` (try in order), `parallel` (query all, return first success), `random` (pick random), `roundrobin` (cycle through). |
 | `tcp_fallback_enabled` | bool | `true` | Automatically retry truncated UDP responses over TCP. |
+| `tcp_fastopen_enabled` | bool | `true` | Use RFC 7413 TCP Fast Open for new plain TCP upstream connections when supported. This can reduce connection latency for TCP fallback and TCP upstream queries; unsupported platforms or kernels use normal TCP connects. |
 | `initial_backoff` | float | `0.1` | Initial backoff (seconds) before first retry, doubles each attempt. |
 
 ---

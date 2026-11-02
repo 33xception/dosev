@@ -13,7 +13,15 @@ def test_load_config_defaults_nonexistent_file(tmp_path):
     config = load_config(str(tmp_path / "missing.conf"))
     assert config["listen_ip"] == "0.0.0.0"
     assert config["dns_cache_ttl"] == 300
+    assert config["tcp_fastopen_enabled"] is True
     assert config["blocklists"]["enabled"] is False
+
+
+def test_load_config_tcp_fastopen_setting(tmp_path):
+    cfg_path = tmp_path / "dosev.conf"
+    cfg_path.write_text("[advanced]\ntcp_fastopen_enabled = false\n", encoding="utf-8")
+
+    assert load_config(str(cfg_path))["tcp_fastopen_enabled"] is False
 
 
 def test_load_config_from_file(tmp_path):

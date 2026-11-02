@@ -109,6 +109,7 @@ def main() -> None:
         load_balancing=config.get("load_balancing", "failover"),
         bootstrap=config.get("bootstrap", {"servers": [], "timeout": 2.0, "retries": 2}),
         tcp_fallback_enabled=config.get("tcp_fallback_enabled", True),
+        tcp_fastopen_enabled=config.get("tcp_fastopen_enabled", True),
         health_config=config.get("health", {}),
     )
 

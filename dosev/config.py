@@ -103,6 +103,8 @@ doh_auto_cache_ttl = 3600
 load_balancing = failover
 # Automatically retry a UDP query over TCP if the response has the TC (truncation) bit set.
 tcp_fallback_enabled = true
+# Use TCP Fast Open for new plain TCP upstream connections where supported.
+tcp_fastopen_enabled = true
 
 # ============================================================================
 # HEALTH – upstream health checks (circuit breaker)
@@ -421,6 +423,7 @@ def load_config(path: str = 'config/dosev.conf') -> Dict[str, Any]:
             'doh_auto_cache_ttl': 3600,
             'load_balancing': 'failover',
             'tcp_fallback_enabled': True,
+            'tcp_fastopen_enabled': True,
             'bootstrap': {
                 'servers': ['1.1.1.1:53', '8.8.8.8:53'],
                 'timeout': 2.0,
@@ -498,6 +501,7 @@ def load_config(path: str = 'config/dosev.conf') -> Dict[str, Any]:
     if load_balancing not in ('failover', 'parallel', 'random', 'roundrobin'):
         load_balancing = 'failover'
     tcp_fallback_enabled = config.getboolean('advanced', 'tcp_fallback_enabled', fallback=True)
+    tcp_fastopen_enabled = config.getboolean('advanced', 'tcp_fastopen_enabled', fallback=True)
 
     # Security
     dnssec_enabled = config.getboolean('security', 'dnssec_enabled', fallback=False)
@@ -682,6 +686,7 @@ def load_config(path: str = 'config/dosev.conf') -> Dict[str, Any]:
         'doh_auto_cache_ttl': doh_auto_cache_ttl,
         'load_balancing': load_balancing,
         'tcp_fallback_enabled': tcp_fallback_enabled,
+            'tcp_fastopen_enabled': tcp_fastopen_enabled,
         'bootstrap': bootstrap,
         'blocklists': blocklists,
         'health': health,

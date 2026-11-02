@@ -841,6 +841,97 @@ async def test_forward_tcp_pool_reuse():
 
 
 @pytest.mark.asyncio
+async def test_open_tcp_connection_enables_fastopen_before_connect(monkeypatch):
+    fastopen_option = 30
+    monkeypatch.setattr(socket, "TCP_FASTOPEN_CONNECT", fastopen_option, raising=False)
+    resolver = DNSResolver(tcp_timeout=3.0)
+    calls = []
+
+    class FakeSocket:
+        def setsockopt(self, level, option, value):
+            calls.append(("setsockopt", level, option, value))
+
+        def settimeout(self, timeout):
+            calls.append(("settimeout", timeout))
+
+        def connect(self, address):
+            calls.append(("connect", address))
+
+        def setblocking(self, enabled):
+            calls.append(("setblocking", enabled))
+
+        def close(self):
+            calls.append(("close",))
+
+    fake_socket = FakeSocket()
+    monkeypatch.setattr(socket, "socket", lambda *args: fake_socket)
+
+    async def fake_to_thread(function, *args):
+        function(*args)
+
+    reader, writer = object(), object()
+
+    async def fake_open_connection(*args, **kwargs):
+        assert kwargs == {"sock": fake_socket}
+        return reader, writer
+
+    monkeypatch.setattr(asyncio, "to_thread", fake_to_thread)
+    monkeypatch.setattr(asyncio, "open_connection", fake_open_connection)
+
+    assert await resolver._open_tcp_connection("192.0.2.1", 53) == (reader, writer)
+    assert calls[:3] == [
+        ("setsockopt", socket.IPPROTO_TCP, fastopen_option, 1),
+        ("settimeout", 3.0),
+        ("connect", ("192.0.2.1", 53)),
+    ]
+    assert calls[3] == ("setblocking", False)
+
+
+@pytest.mark.asyncio
+async def test_open_tcp_connection_can_disable_fastopen(monkeypatch):
+    resolver = DNSResolver(tcp_fastopen_enabled=False)
+    reader, writer = object(), object()
+    open_connection = AsyncMock(return_value=(reader, writer))
+    monkeypatch.setattr(asyncio, "open_connection", open_connection)
+
+    assert await resolver._open_tcp_connection("192.0.2.1", 53) == (reader, writer)
+    open_connection.assert_awaited_once_with("192.0.2.1", 53)
+
+
+@pytest.mark.asyncio
+async def test_open_tcp_connection_falls_back_without_fastopen_cookie(monkeypatch):
+    monkeypatch.setattr(socket, "TCP_FASTOPEN_CONNECT", 30, raising=False)
+    resolver = DNSResolver()
+
+    class FakeSocket:
+        def setsockopt(self, level, option, value):
+            pass
+
+        def settimeout(self, timeout):
+            pass
+
+        def connect(self, address):
+            raise BlockingIOError
+
+        def close(self):
+            pass
+
+    fake_socket = FakeSocket()
+    monkeypatch.setattr(socket, "socket", lambda *args: fake_socket)
+
+    async def fake_to_thread(function, *args):
+        function(*args)
+
+    reader, writer = object(), object()
+    open_connection = AsyncMock(return_value=(reader, writer))
+    monkeypatch.setattr(asyncio, "to_thread", fake_to_thread)
+    monkeypatch.setattr(asyncio, "open_connection", open_connection)
+
+    assert await resolver._open_tcp_connection("192.0.2.1", 53) == (reader, writer)
+    open_connection.assert_awaited_once_with("192.0.2.1", 53)
+
+
+@pytest.mark.asyncio
 async def test_forward_tcp_closes_new_connection_after_timeout(monkeypatch):
     resolver = DNSResolver(
         upstreams=[{"address": "127.0.0.1", "protocol": "tcp", "port": 53, "ip": "127.0.0.1"}]
