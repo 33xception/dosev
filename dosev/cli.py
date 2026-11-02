@@ -79,6 +79,7 @@ def main() -> None:
         dnssec_chain_validation=config.get("dnssec_chain_validation", True),
         dnssec_max_iterations=config.get("dnssec_max_iterations", 100),
         dns_scrub_unsolicited_ns=config.get("dns_scrub_unsolicited_ns", True),
+        pqc_mode=config.get("pqc_mode", "auto"),
         metrics_enabled=config.get("metrics_enabled", False),
         metrics_port=config.get("metrics_port", 8000),
         uvloop_enable=config.get("uvloop_enable", False),

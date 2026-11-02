@@ -588,7 +588,8 @@ class DNSResolver:
                   bootstrap: Optional[Dict[str, Any]] = None,
                   tcp_fallback_enabled: bool = True,
                   tcp_fastopen_enabled: bool = True,
-                  health_config: Optional[Dict[str, Any]] = None) -> None:
+                  health_config: Optional[Dict[str, Any]] = None,
+                  pqc_mode: str = 'auto') -> None:
 
         self.upstreams: List[Dict[str, Any]] = upstreams or []
         if bootstrap is None:
@@ -764,6 +765,23 @@ class DNSResolver:
 
         self.tcp_fallback_enabled: bool = tcp_fallback_enabled
         self.tcp_fastopen_enabled: bool = bool(tcp_fastopen_enabled)
+
+        # PQC mode - validate and store
+        self.pqc_mode: str = pqc_mode.lower()
+        if self.pqc_mode not in ('auto', 'off'):
+            self.pqc_mode = 'auto'
+        
+        # Emit startup warning if pqc_mode is auto but Python's ssl doesn't support it
+        if self.pqc_mode == 'auto':
+            import ssl as ssl_module
+            if ssl_module.OPENSSL_VERSION_INFO < (3, 5, 0, 0, 0):
+                self.logger.warning(
+                    "pqc_mode=auto requested but Python's ssl module is linked to OpenSSL %s < 3.5. "
+                    "Hybrid X25519MLKEM768 groups are NOT available. "
+                    "To use PQ groups, set OPENSSL_CONF environment variable before starting dosev. "
+                    "Example: OPENSSL_CONF=/etc/ssl/openssl-pq.cnf dosev",
+                    ssl_module.OPENSSL_VERSION
+                )
 
         self._health_config: Dict[str, Any] = health_config or {}
         self._health_enabled: bool = self._health_config.get('enabled', False)
@@ -4554,7 +4572,8 @@ class DNSResolver:
                             bootstrap: Optional[Dict[str, Any]] = None,
                             tcp_fallback_enabled: Optional[bool] = None,
                             tcp_fastopen_enabled: Optional[bool] = None,
-                            health_config: Optional[Dict[str, Any]] = None) -> None:
+                            health_config: Optional[Dict[str, Any]] = None,
+                            pqc_mode: Optional[str] = None) -> None:
         async with self._config_lock:
             if verbose is not None:
                 self.verbose = bool(verbose)
@@ -4683,6 +4702,10 @@ class DNSResolver:
                 self._health_healthy_threshold = health_config.get('healthy_threshold', 2)
                 self._health_cooldown = health_config.get('cooldown', 60)
                 self._health_domain = health_config.get('domain', '.')
+            if pqc_mode is not None:
+                self.pqc_mode = pqc_mode.lower()
+                if self.pqc_mode not in ('auto', 'off'):
+                    self.pqc_mode = 'auto'
                 if self._health_enabled and self._health_task is None and self.upstreams:
                     self._health_task = asyncio.create_task(self._health_check_loop())
                     self._background_tasks.add(self._health_task)

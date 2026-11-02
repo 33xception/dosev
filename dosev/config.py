@@ -151,6 +151,17 @@ dnssec_max_iterations = 100
 # Scrub unsolicited NS records from authority section to prevent cache poisoning.
 # See: CVE-2025-11411, RFC 2181 Section 5.4.1
 dns_scrub_unsolicited_ns = true
+
+# ---------- Post-Quantum Cryptography ----------
+# pqc_mode controls post-quantum TLS group selection for encrypted transports (DoT/DoH/DoQ).
+# - auto: Use hybrid X25519MLKEM768+X25519 groups where supported (requires OpenSSL >= 3.5)
+# - off: Use only classical ECDHE groups (default behavior)
+# Note: Python's ssl module does not expose group control APIs. To use hybrid groups,
+# you must set OPENSSL_CONF environment variable before starting dosev.
+# Example: OPENSSL_CONF=/etc/ssl/openssl-pq.cnf dosev
+# The setting is NOT hot-reloadable; it only affects the startup warning.
+pqc_mode = auto
+
 # Certificate pinning: comma‑separated list of host=sha256(der) pairs.
 pinned_certs =
 # Rebinding protection: prevent responses containing private IPs.
@@ -368,6 +379,11 @@ def _validate_and_warn(config: Dict[str, Any]) -> None:
     if dnssec_max_iterations < 0:
         raise ValueError('dnssec_max_iterations must be non-negative')
 
+    # PQC mode validation
+    pqc_mode = config.get('pqc_mode', 'auto')
+    if pqc_mode not in ('auto', 'off'):
+        raise ValueError('pqc_mode must be auto or off')
+
 def load_config(path: str = 'config/dosev.conf') -> Dict[str, Any]:
     config = configparser.ConfigParser()
 
@@ -398,6 +414,7 @@ def load_config(path: str = 'config/dosev.conf') -> Dict[str, Any]:
             'dnssec_chain_validation': True,
             'dnssec_max_iterations': 100,
             'dns_scrub_unsolicited_ns': True,
+            'pqc_mode': 'auto',
             'metrics_enabled': False,
             'metrics_port': 8000,
             'uvloop_enable': False,
@@ -513,6 +530,9 @@ def load_config(path: str = 'config/dosev.conf') -> Dict[str, Any]:
     dnssec_chain_validation = config.getboolean('security', 'dnssec_chain_validation', fallback=True)
     dnssec_max_iterations = config.getint('security', 'dnssec_max_iterations', fallback=100)
     dns_scrub_unsolicited_ns = config.getboolean('security', 'dns_scrub_unsolicited_ns', fallback=True)
+    pqc_mode = config.get('security', 'pqc_mode', fallback='auto').lower()
+    if pqc_mode not in ('auto', 'off'):
+        pqc_mode = 'auto'
 
     pinned_raw = config.get('security', 'pinned_certs', fallback='')
     dns_pinned_certs = {}
@@ -661,6 +681,7 @@ def load_config(path: str = 'config/dosev.conf') -> Dict[str, Any]:
         'dnssec_chain_validation': dnssec_chain_validation,
         'dnssec_max_iterations': dnssec_max_iterations,
         'dns_scrub_unsolicited_ns': dns_scrub_unsolicited_ns,
+        'pqc_mode': pqc_mode,
         'metrics_enabled': metrics_enabled,
         'metrics_port': metrics_port,
         'uvloop_enable': uvloop_enable,

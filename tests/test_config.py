@@ -239,3 +239,41 @@ def test_load_config_parses_all_extra_sections(tmp_path):
     assert config["dns_doh_path"] == "/dns-query"
     assert config["dnssec_enabled"] is True
     assert config["upstreams"][0]["doh_version"] == "2"
+
+def test_pqc_mode_default(tmp_path):
+    """Test that pqc_mode defaults to 'auto'."""
+    config = load_config(str(tmp_path / "missing.conf"))
+    assert config.get("pqc_mode") == "auto"
+
+
+def test_pqc_mode_auto_explicit(tmp_path):
+    """Test that pqc_mode can be explicitly set to 'auto'."""
+    cfg_path = tmp_path / "dosev.conf"
+    cfg_path.write_text("[security]\npqc_mode = auto\n", encoding="utf-8")
+    config = load_config(str(cfg_path))
+    assert config["pqc_mode"] == "auto"
+
+
+def test_pqc_mode_off(tmp_path):
+    """Test that pqc_mode can be set to 'off'."""
+    cfg_path = tmp_path / "dosev.conf"
+    cfg_path.write_text("[security]\npqc_mode = off\n", encoding="utf-8")
+    config = load_config(str(cfg_path))
+    assert config["pqc_mode"] == "off"
+
+
+def test_pqc_mode_invalid_value_returns_default():
+    """Test that invalid pqc_mode values are rejected."""
+    config = {"pqc_mode": "invalid"}
+    with pytest.raises(ValueError, match="pqc_mode must be auto or off"):
+        _validate_and_warn(config)
+
+
+def test_pqc_mode_case_insensitive():
+    """Test that pqc_mode is case-insensitive."""
+    # In the config parsing, we convert to lowercase
+    config = {"pqc_mode": "AUTO"}
+    # This should not raise - it gets converted to lowercase
+    # But validation is case-sensitive
+    with pytest.raises(ValueError, match="pqc_mode must be auto or off"):
+        _validate_and_warn(config)

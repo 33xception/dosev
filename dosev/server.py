@@ -274,6 +274,7 @@ async def reload_resolver(holder: ResolverHolder,
         bootstrap=config.get("bootstrap"),
         tcp_fallback_enabled=config.get("tcp_fallback_enabled", True),
         health_config=config.get("health"),
+        pqc_mode=config.get("pqc_mode", "auto"),
     )
 
     if blocklists:
@@ -698,7 +699,8 @@ async def run_server(listen_ip: str, listen_port: int,
                      bootstrap: Optional[Dict[str, Any]] = None,
                      dns_enable_http3: bool = False,
                      tcp_fallback_enabled: bool = True,
-                     health_config: Optional[Dict[str, Any]] = None) -> None:
+                     health_config: Optional[Dict[str, Any]] = None,
+                     pqc_mode: str = 'auto') -> None:
 
     logging.getLogger().setLevel(logging.DEBUG if verbose else logging.INFO)
 
@@ -707,6 +709,7 @@ async def run_server(listen_ip: str, listen_port: int,
         verbose=verbose,
         disable_ipv6=disable_ipv6,
         strip_ipv6_records=strip_ipv6_records,
+        pqc_mode=pqc_mode,
         cache_ttl=dns_cache_ttl,
         cache_max_size=dns_cache_max_size,
         negative_cache_ttl=dns_negative_cache_ttl,
@@ -929,6 +932,7 @@ def run_server_sync(listen_ip: str, listen_port: int,
                     dnssec_chain_validation: bool = True,
                     dnssec_max_iterations: int = 100,
                     dns_scrub_unsolicited_ns: bool = True,
+                    pqc_mode: str = 'auto',
                     metrics_enabled: bool = False,
                     metrics_port: int = 8000,
                     uvloop_enable: bool = False,
