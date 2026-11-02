@@ -80,4 +80,41 @@ async def test_flight_coalescing(monkeypatch):
     results = await asyncio.gather(invoke(), invoke(), invoke())
     assert call_count == 1, f"Expected 1 call, got {call_count}"
     assert all(r == results[0] for r in results)
+
+
+@pytest.mark.asyncio
+async def test_cancelled_flight_leader_releases_waiter(monkeypatch):
+    resolver = DNSResolver(
+        upstreams=[{'address': '127.0.0.1', 'protocol': 'udp', 'ip': '127.0.0.1'}],
+    )
+    upstream_started = asyncio.Event()
+    call_count = 0
+
+    async def fake_try_upstream(upstream, data, _health_check=False, _no_retry=False):
+        nonlocal call_count
+        call_count += 1
+        if call_count == 1:
+            upstream_started.set()
+            await asyncio.Event().wait()
+        query_msg = dns.message.from_wire(data)
+        response = dns.message.make_response(query_msg)
+        response.answer.append(dns.rrset.from_text(
+            'example.com.', 60, dns.rdataclass.IN, dns.rdatatype.A, '192.0.2.1'
+        ))
+        return response.to_wire()
+
+    monkeypatch.setattr(resolver, '_try_upstream', fake_try_upstream)
+    query = dns.message.make_query('example.com', 'A').to_wire()
+
+    leader = asyncio.create_task(resolver.forward_dns_query(query))
+    await upstream_started.wait()
+    waiter = asyncio.create_task(resolver.forward_dns_query(query))
+    await asyncio.sleep(0)
+    leader.cancel()
+    with pytest.raises(asyncio.CancelledError):
+        await leader
+
+    response = await asyncio.wait_for(waiter, timeout=1.0)
+    assert dns.message.from_wire(response).answer
+    assert call_count == 2
     

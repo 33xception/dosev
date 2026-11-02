@@ -3,6 +3,7 @@ Consolidated DNSSEC tests.
 Combines: test_dnssec_cd.py, test_dnssec_chain.py, test_dnssec_keytrap.py
 """
 import asyncio
+import hashlib
 import time
 import tempfile
 import os
@@ -51,6 +52,10 @@ def test_nsec3_hash_uses_module_limit_constant():
     result = resolver._nsec3_hash("example.com.", b"salt", 0, 1)
     assert result is not None
     assert isinstance(result, str)
+    expected = hashlib.sha1(
+        dns.name.from_text("example.com.").to_wire() + b"salt"
+    ).digest()
+    assert result == base64.b32hexencode(expected).decode().lower().rstrip("=")
 
 
 @pytest.mark.asyncio
@@ -145,6 +150,69 @@ async def test_cd_flag_passthrough_ignores_bogus(resolver_with_dnssec):
 # ---------- Chain validation tests ----------
 class TestDNSSECChain:
     @pytest.mark.asyncio
+    async def test_ds_rrset_is_verified_with_parent_key(self):
+        resolver = DNSResolver(dnssec_enabled=True, dnssec_chain_validation=True)
+        parent_key = make_dnskey_rrset(".", 257, 3, 8, b"parent-key")
+        ds_rrset = dns.rrset.from_text(
+            "example.com.", 3600, "IN", "DS", f"12345 8 2 {'aa' * 32}"
+        )
+        ds_sig = dns.rrset.from_text(
+            "example.com.", 3600, "IN", "RRSIG",
+            "DS 8 2 3600 20350101000000 20300101000000 12345 . deadbeef"
+        )
+        response = dns.message.Message()
+        response.answer.extend((ds_rrset, ds_sig))
+        resolver._dnssec_lookup = AsyncMock(return_value=response)
+
+        with patch("dns.dnssec.validate", return_value=None) as validate:
+            result = await resolver._get_ds_for_zone(
+                "example.com", ".", parent_key=parent_key
+            )
+
+        assert result is ds_rrset
+        validate.assert_called_once()
+        assert validate.call_args.args[0] is ds_rrset
+        assert validate.call_args.args[2] == {dns.name.root: parent_key}
+
+    @pytest.mark.asyncio
+    async def test_dnskey_rrset_is_verified_with_ds_matched_key(self):
+        resolver = DNSResolver(dnssec_enabled=True, dnssec_chain_validation=True)
+        parent_key = dns.rrset.from_text(
+            "com.", 3600, "IN", "DNSKEY",
+            f"257 3 8 {base64.b64encode(b'parent-key').decode()}"
+        )
+        child_keys = dns.rrset.from_text(
+            "example.com.", 3600, "IN", "DNSKEY",
+            f"257 3 8 {base64.b64encode(b'child-key').decode()}"
+        )
+        ds = dns.dnssec.make_ds("example.com.", child_keys[0], "SHA256")
+        ds_rrset = dns.rrset.RRset(
+            dns.name.from_text("example.com."), dns.rdataclass.IN, dns.rdatatype.DS
+        )
+        ds_rrset.ttl = 3600
+        ds_rrset.add(ds)
+        dnskey_sig = dns.rrset.from_text(
+            "example.com.", 3600, "IN", "RRSIG",
+            "DNSKEY 8 2 3600 20350101000000 20300101000000 12345 example.com. deadbeef"
+        )
+        response = dns.message.Message()
+        response.answer.extend((child_keys, dnskey_sig))
+
+        resolver._dnssec_key_cache["com"] = (parent_key, time.time() + 3600)
+        resolver._get_ds_for_zone = AsyncMock(return_value=ds_rrset)
+        resolver._fetch_dnskey_response = AsyncMock(return_value=(child_keys, response))
+
+        with patch("dns.dnssec.validate", return_value=None) as validate:
+            result = await resolver._get_validated_dnskey("example.com")
+
+        assert result is child_keys
+        validate.assert_called_once()
+        assert validate.call_args.args[0] is child_keys
+        assert validate.call_args.args[2] == {
+            dns.name.from_text("example.com."): child_keys
+        }
+
+    @pytest.mark.asyncio
     async def test_chain_validation_valid(self):
         resolver = DNSResolver(
             dnssec_enabled=True,
@@ -191,7 +259,7 @@ class TestDNSSECChain:
         )
 
         def fake_hash(name, salt, iterations, algorithm):
-            return "aaaaaaaaaaaaaaaa"
+            return "0" * 32
         resolver._nsec3_hash = fake_hash
 
         nsec3 = dns.rdtypes.ANY.NSEC3.NSEC3(
@@ -201,23 +269,33 @@ class TestDNSSECChain:
             flags=0x01,
             iterations=0,
             salt=b'',
-            next=b'aaaaaaaaaaaaaaaa',
+            next=base64.b32hexdecode("1" * 32),
             windows=[]
         )
-        nsec3_rrset = dns.rrset.RRset(dns.name.from_text("aaaaaaaaaaaaaaaa.example.com."), dns.rdataclass.IN, dns.rdatatype.NSEC3)
+        nsec3_rrset = dns.rrset.RRset(dns.name.from_text(f'{"0" * 32}.com.'), dns.rdataclass.IN, dns.rdatatype.NSEC3)
         nsec3_rrset.ttl = 3600
         nsec3_rrset.add(nsec3)
+        nsec3_sig = dns.rrset.from_text(
+            str(nsec3_rrset.name), 3600, "IN", "RRSIG",
+            "NSEC3 8 1 3600 20350101000000 20300101000000 12345 . deadbeef"
+        )
+        ns_rrset = dns.rrset.from_text(
+            "example.com.", 3600, "IN", "NS", "ns.example.com."
+        )
 
         async def fake_lookup(qname, rdtype, dnssec_ok=False):
-            if rdtype == dns.rdatatype.NSEC3 and qname == ".":
+            if rdtype == dns.rdatatype.DS and qname == "example.com":
                 msg = dns.message.Message()
+                msg.authority.append(ns_rrset)
                 msg.authority.append(nsec3_rrset)
+                msg.authority.append(nsec3_sig)
                 return msg
             return None
 
         resolver._dnssec_lookup = fake_lookup
 
-        result = await resolver._prove_insecure_delegation("example.com", ".")
+        with patch("dns.dnssec.validate", return_value=None):
+            result = await resolver._prove_insecure_delegation("example.com", ".")
         assert result is True
 
     @pytest.mark.asyncio
@@ -644,9 +722,9 @@ class TestDNSSECChain:
         resp.set_rcode(dns.rcode.NXDOMAIN)
 
         hash_map = {
-            "example.com.": base64.b32encode(b"\x22" * 20).decode().lower().rstrip("="),
-            "foo.example.com.": base64.b32encode(b"\x33" * 20).decode().lower().rstrip("="),
-            "*.example.com.": base64.b32encode(b"\x44" * 20).decode().lower().rstrip("="),
+            "example.com.": base64.b32hexencode(b"\x22" * 20).decode().lower().rstrip("="),
+            "foo.example.com.": base64.b32hexencode(b"\x33" * 20).decode().lower().rstrip("="),
+            "*.example.com.": base64.b32hexencode(b"\x44" * 20).decode().lower().rstrip("="),
         }
 
         def fake_hash(name: str, salt: bytes, iterations: int, algorithm: int) -> str:
@@ -941,7 +1019,7 @@ class TestDNSSECChain:
             with patch('time.time', return_value=1893456000):
                 secure, insecure = await resolver._dnssec_validate_chain("example.com", msg.to_wire(), dnssec_requested=True)
                 assert not secure
-                assert insecure
+                assert not insecure
 
     @pytest.mark.asyncio
     async def test_chain_validation_fallback_to_legacy(self):
@@ -987,7 +1065,7 @@ class TestDNSSECChain:
         with patch('time.time', return_value=1893456000):
             secure, insecure = await resolver._dnssec_validate_chain("example.com", msg.to_wire(), dnssec_requested=True)
             assert not secure
-            assert insecure
+            assert not insecure
 
 
 # ---------- KeyTrap tests ----------
@@ -1038,7 +1116,7 @@ async def test_dnssec_max_validations_limit(keytrap_resolver):
         with patch('time.time', return_value=1893456000):
             secure, insecure = await keytrap_resolver._dnssec_validate(qname, wire, dnssec_requested=True)
             assert secure is False
-            assert insecure is True
+            assert insecure is False
             assert validate_calls == 2
 
 

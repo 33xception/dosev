@@ -1806,7 +1806,7 @@ class DNSResolver:
         for _ in range(iterations):
             digest = hashlib.sha1(digest + salt).digest()
         # base32 encode without padding, lowercase
-        b32 = base64.b32encode(digest).decode().lower().rstrip('=')
+        b32 = base64.b32hexencode(digest).decode().lower().rstrip('=')
         return b32
 
     @staticmethod
@@ -1821,7 +1821,34 @@ class DNSResolver:
                         return True
         return False
 
-# Add a depth parameter to _get_validated_dnskey:
+    @staticmethod
+    def _rrsig_for(rrset: dns.rrset.RRset, sections: Iterable[Iterable[dns.rrset.RRset]]) -> Optional[dns.rrset.RRset]:
+        signatures = dns.rrset.RRset(rrset.name, rrset.rdclass, dns.rdatatype.RRSIG)
+        found = False
+        for section in sections:
+            for candidate in section:
+                if candidate.rdtype != dns.rdatatype.RRSIG or candidate.name != rrset.name:
+                    continue
+                for signature in candidate:
+                    if signature.type_covered == rrset.rdtype:
+                        signatures.add(signature)
+                        found = True
+        return signatures if found else None
+
+    @staticmethod
+    def _cache_insecure_delegation(cache: Dict[str, float], zone: str) -> bool:
+        expiry = cache.get(zone)
+        return expiry is not None and time.time() < expiry
+
+    async def _is_proven_insecure_name(self, qname: str) -> bool:
+        name = dns.name.from_text(qname)
+        for offset in range(len(name.labels) - 1):
+            candidate = dns.name.Name(name.labels[offset:]).to_text().rstrip('.')
+            await self._get_validated_dnskey(candidate)
+            if self._cache_insecure_delegation(self._dnssec_insecure_cache, candidate):
+                return True
+        return False
+
     async def _get_validated_dnskey(self, zone: str, _depth: int = 0) -> Optional[dns.rrset.RRset]:
         if _depth > self.dnssec_max_iterations:
             self.logger.warning("DNSSEC chain depth exceeded limit (%d) for zone %s", self.dnssec_max_iterations, zone)
@@ -1842,59 +1869,55 @@ class DNSResolver:
             return None
 
         parent_zone = ".".join(zone.split(".")[1:]) or "."
-        parent_ds = await self._get_ds_for_zone(zone, parent_zone, _depth + 1)
-        if parent_ds is None:
-            if await self._prove_insecure_delegation(zone, parent_zone):
-                async with self._dnssec_cache_lock:
-                    self._dnssec_insecure_cache[zone] = time.time() + self._dnssec_insecure_cache_ttl
-                return None
-            self.logger.debug("Cannot prove insecure for %s, treating as insecure", zone)
-            return None
-
         parent_key = await self._get_validated_dnskey(parent_zone, _depth + 1)
         if parent_key is None:
-            self.logger.debug("No validated key for parent %s", parent_zone)
+            if self._cache_insecure_delegation(self._dnssec_insecure_cache, parent_zone):
+                async with self._dnssec_cache_lock:
+                    self._dnssec_insecure_cache[zone] = time.time() + self._dnssec_insecure_cache_ttl
             return None
 
-        child_dnskey = await self._fetch_dnskey(zone)
-        if child_dnskey is None:
+        parent_ds = await self._get_ds_for_zone(zone, parent_zone, _depth + 1, parent_key)
+        if parent_ds is None:
             return None
 
-        ds_matches = False
+        dnskey_result = await self._fetch_dnskey_response(zone)
+        if dnskey_result is None:
+            return None
+        child_dnskey, dnskey_msg = dnskey_result
+
+        matched_keys = dns.rrset.RRset(child_dnskey.name, child_dnskey.rdclass, child_dnskey.rdtype)
+        matched_keys.ttl = child_dnskey.ttl
+        zone_name = dns.name.from_text(zone)
         for ds_rr in parent_ds:
             for key_rr in child_dnskey:
-                if ds_rr.key_tag == dns.dnssec.key_id(key_rr):
-                    ds_matches = True
-                    break
-            if ds_matches:
-                break
+                if not key_rr.flags & 0x0100 or ds_rr.algorithm != key_rr.algorithm:
+                    continue
+                if ds_rr.key_tag != dns.dnssec.key_id(key_rr):
+                    continue
+                try:
+                    candidate = dns.dnssec.make_ds(zone_name, key_rr, ds_rr.digest_type)
+                except Exception:
+                    continue
+                if candidate.digest == ds_rr.digest:
+                    matched_keys.add(key_rr)
 
-        if not ds_matches:
-            ds_candidates = []
-            zone_name = dns.name.from_text(zone)
-            for key_rr in child_dnskey:
-                for ds_rr in parent_ds:
-                    digest_alg = {1: "SHA1", 2: "SHA256", 4: "SHA384"}.get(ds_rr.digest_type, "SHA256")
-                    try:
-                        ds_candidate = dns.dnssec.make_ds(zone_name, key_rr, digest_alg)
-                        ds_candidates.append(ds_candidate)
-                    except Exception:
-                        continue
-            for ds_candidate in ds_candidates:
-                for ds_rr in parent_ds:
-                    if (ds_candidate.key_tag == ds_rr.key_tag and
-                        ds_candidate.digest_type == ds_rr.digest_type and
-                        ds_candidate.digest == ds_rr.digest):
-                        ds_matches = True
-                        break
-                if ds_matches:
-                    break
-
-        if not ds_matches:
+        if not len(matched_keys):
             self.logger.debug("DS mismatch for zone %s", zone)
             return None
 
-        ttl = child_dnskey.ttl if child_dnskey else 300
+        signatures = self._rrsig_for(
+            child_dnskey,
+            (dnskey_msg.answer, dnskey_msg.authority, dnskey_msg.additional),
+        )
+        if signatures is None:
+            return None
+        try:
+            dns.dnssec.validate(child_dnskey, signatures, {zone_name: matched_keys})
+        except Exception as exc:
+            self.logger.warning("DNSKEY RRset validation failed for %s: %s", zone, exc)
+            return None
+
+        ttl = min(child_dnskey.ttl, parent_ds.ttl)
         async with self._dnssec_cache_lock:
             if len(self._dnssec_key_cache) >= self._dnssec_key_cache_maxsize:
                 oldest = min(self._dnssec_key_cache.items(), key=lambda kv: kv[1][1])[0]
@@ -1902,7 +1925,8 @@ class DNSResolver:
             self._dnssec_key_cache[zone] = (child_dnskey, time.time() + ttl)
         return child_dnskey
 
-    async def _get_ds_for_zone(self, zone: str, parent_zone: str, _depth: int = 0) -> Optional[dns.rrset.RRset]:
+    async def _get_ds_for_zone(self, zone: str, parent_zone: str, _depth: int = 0,
+                               parent_key: Optional[dns.rrset.RRset] = None) -> Optional[dns.rrset.RRset]:
         if _depth > self.dnssec_max_iterations:
             self.logger.warning("DNSSEC chain depth exceeded limit (%d) for DS zone %s", self.dnssec_max_iterations, zone)
             return None
@@ -1927,6 +1951,26 @@ class DNSResolver:
                 break
 
         if ds_rrset is None:
+            if parent_key is not None and await self._prove_insecure_delegation(
+                zone, parent_zone, msg, parent_key
+            ):
+                async with self._dnssec_cache_lock:
+                    self._dnssec_insecure_cache[zone] = time.time() + self._dnssec_insecure_cache_ttl
+            return None
+
+        if parent_key is None:
+            parent_key = await self._get_validated_dnskey(parent_zone, _depth + 1)
+        signatures = self._rrsig_for(ds_rrset, (msg.answer, msg.authority, msg.additional))
+        if parent_key is None or signatures is None:
+            return None
+        try:
+            dns.dnssec.validate(
+                ds_rrset,
+                signatures,
+                {dns.name.from_text(parent_zone): parent_key},
+            )
+        except Exception as exc:
+            self.logger.warning("DS RRset validation failed for %s: %s", zone, exc)
             return None
 
         ttl = ds_rrset.ttl if ds_rrset else 300
@@ -1937,33 +1981,57 @@ class DNSResolver:
             self._dnssec_ds_cache[cache_key] = (ds_rrset, time.time() + ttl)
         return ds_rrset
 
-    async def _fetch_dnskey(self, zone: str) -> Optional[dns.rrset.RRset]:
+    async def _fetch_dnskey_response(self, zone: str) -> Optional[Tuple[dns.rrset.RRset, dns.message.Message]]:
         msg = await self._dnssec_lookup(zone, dns.rdatatype.DNSKEY, dnssec_ok=True)
         if msg is None:
             return None
         for rrset in msg.answer:
             if rrset.rdtype == dns.rdatatype.DNSKEY:
-                if self.dnssec_max_dnskey_records > 0:
-                    count = 0
-                    limited_rr = dns.rrset.RRset(rrset.name, rrset.rdclass, rrset.rdtype)
-                    limited_rr.ttl = rrset.ttl
-                    for r in rrset:
-                        if count >= self.dnssec_max_dnskey_records:
-                            break
-                        limited_rr.add(r)
-                        count += 1
-                    return limited_rr
-                return rrset
+                if self.dnssec_max_dnskey_records > 0 and len(rrset) > self.dnssec_max_dnskey_records:
+                    self.logger.warning("DNSKEY RRset for %s exceeds configured limit", zone)
+                    return None
+                return rrset, msg
         return None
 
-    async def _prove_insecure_delegation(self, zone: str, parent_zone: str) -> bool:
-        async with self._dnssec_cache_lock:
-            if zone in self._dnssec_insecure_cache:
-                return True
+    async def _fetch_dnskey(self, zone: str) -> Optional[dns.rrset.RRset]:
+        result = await self._fetch_dnskey_response(zone)
+        return result[0] if result is not None else None
 
-        msg = await self._dnssec_lookup(parent_zone, dns.rdatatype.NSEC3, dnssec_ok=True)
+    async def _prove_insecure_delegation(self, zone: str, parent_zone: str,
+                                         msg: Optional[dns.message.Message] = None,
+                                         parent_key: Optional[dns.rrset.RRset] = None) -> bool:
+        if self._cache_insecure_delegation(self._dnssec_insecure_cache, zone):
+            return True
+        if msg is None:
+            msg = await self._dnssec_lookup(zone, dns.rdatatype.DS, dnssec_ok=True)
         if msg is None:
             return False
+
+        delegation_ns = any(
+            rrset.rdtype == dns.rdatatype.NS and rrset.name == dns.name.from_text(zone)
+            for section in (msg.answer, msg.authority)
+            for rrset in section
+        )
+        if not delegation_ns:
+            return False
+        if parent_key is None:
+            parent_key = await self._get_validated_dnskey(parent_zone)
+        if parent_key is None:
+            return False
+
+        sections = (msg.answer, msg.authority, msg.additional)
+        for rrset in msg.authority:
+            if rrset.rdtype == dns.rdatatype.NSEC and rrset.name == dns.name.from_text(zone):
+                signatures = self._rrsig_for(rrset, sections)
+                if signatures is None:
+                    continue
+                try:
+                    dns.dnssec.validate(rrset, signatures, {dns.name.from_text(parent_zone): parent_key})
+                except Exception:
+                    continue
+                if (self._nsec3_bitmap_contains(rrset[0].windows, dns.rdatatype.NS)
+                    and not self._nsec3_bitmap_contains(rrset[0].windows, dns.rdatatype.DS)):
+                    return True
 
         nsec3_rrsets = []
         for rrset in msg.authority:
@@ -1972,6 +2040,15 @@ class DNSResolver:
 
         if not nsec3_rrsets:
             return False
+
+        for rrset in nsec3_rrsets:
+            signatures = self._rrsig_for(rrset, sections)
+            if signatures is None:
+                return False
+            try:
+                dns.dnssec.validate(rrset, signatures, {dns.name.from_text(parent_zone): parent_key})
+            except Exception:
+                return False
 
         nsec3_rrsets.sort(key=lambda rrset: str(rrset.name).lower())
 
@@ -1989,13 +2066,11 @@ class DNSResolver:
             for rr in rrset:
                 rr_name = str(rrset.name).lower().rstrip('.')
                 hash_part = rr_name.split('.')[0]
-                next_hash = base64.b32encode(rr.next).decode().lower().rstrip('=')
+                next_hash = base64.b32hexencode(rr.next).decode().lower().rstrip('=')
 
                 if hash_part <= zone_hash < next_hash:
                     if rr.flags & NSEC3_OPT_OUT:
                         if not self._nsec3_bitmap_contains(rr.windows, dns.rdatatype.DS):
-                            async with self._dnssec_cache_lock:
-                                self._dnssec_insecure_cache[zone] = time.time() + self._dnssec_insecure_cache_ttl
                             return True
                     return False
 
@@ -2004,8 +2079,6 @@ class DNSResolver:
                     if zone_hash >= hash_part and zone_hash < first_hash:
                         if rr.flags & NSEC3_OPT_OUT:
                             if not self._nsec3_bitmap_contains(rr.windows, dns.rdatatype.DS):
-                                async with self._dnssec_cache_lock:
-                                    self._dnssec_insecure_cache[zone] = time.time() + self._dnssec_insecure_cache_ttl
                                 return True
                         return False
 
@@ -2090,7 +2163,7 @@ class DNSResolver:
             for rr in rrset:
                 rr_name = str(rrset.name).lower().rstrip('.')
                 hash_part = rr_name.split('.')[0]
-                next_hash = base64.b32encode(rr.next).decode().lower().rstrip('=')
+                next_hash = base64.b32hexencode(rr.next).decode().lower().rstrip('=')
                 entry = (hash_part, next_hash, rr, rrset)
                 sorted_nsec3.append(entry)
                 hash_to_rr[hash_part] = entry
@@ -2187,15 +2260,14 @@ class DNSResolver:
             )
         except asyncio.TimeoutError:
             self.logger.warning("DNSSEC chain validation timeout for %s after %.1fs", qname, self.dnssec_validation_timeout)
-            return False, True
+            return False, False
 
     async def _dnssec_validate_chain_internal(self, qname: str, response_wire: bytes, dnssec_requested: bool = True) -> Tuple[bool, bool]:
         try:
             msg = dns.message.from_wire(response_wire)
         except Exception as e:
-            # Malformed response from upstream; treat as insecure rather than raising
             self.logger.warning("Malformed DNS response during DNSSEC validation for %s: %s", qname, e)
-            return False, True
+            return False, False
         # Check if this is a negative answer (NXDOMAIN or NODATA)
         is_negative = (msg.rcode() == dns.rcode.NXDOMAIN or
                        (msg.rcode() == dns.rcode.NOERROR and not msg.answer))
@@ -2204,13 +2276,12 @@ class DNSResolver:
             if await self._validate_nsec3_negative(qname, msg):
                 self.logger.debug("NSEC3 negative validation passed for %s", qname)
                 return True, False
-            else:
-                return False, True
+            return False, await self._is_proven_insecure_name(qname)
 
         # Positive answer: validate signatures
         has_rrsig = any(rr.rdtype == dns.rdatatype.RRSIG for rr in msg.answer)
         if not has_rrsig:
-            return False, True
+            return False, await self._is_proven_insecure_name(qname)
 
         validation_counter = 0
         max_validations = self.dnssec_max_validations if self.dnssec_max_validations > 0 else 999999
@@ -2242,17 +2313,17 @@ class DNSResolver:
                     if self._dnssec_raw_anchors and dns.name.root in self._dnssec_raw_anchors:
                         key_rrset = self._dnssec_raw_anchors[dns.name.root]
                     else:
-                        self.logger.debug("No root key for signer %s, treating as insecure", signer_name)
-                        return False, True
+                        self.logger.debug("No root key for signer %s", signer_name)
+                        return False, await self._is_proven_insecure_name(qname)
                 else:
-                    self.logger.debug("No validated key for signer %s, treating as insecure", signer_name)
-                    return False, True
+                    self.logger.debug("No validated key for signer %s", signer_name)
+                    return False, await self._is_proven_insecure_name(qname)
 
             validation_counter += 1
             if validation_counter > max_validations:
-                self.logger.warning("DNSSEC validation limit (%d) exceeded for %s, treating as insecure",
+                self.logger.warning("DNSSEC validation limit (%d) exceeded for %s; refusing to validate",
                                     max_validations, qname)
-                return False, True
+                return False, False
 
             try:
                 await loop.run_in_executor(
@@ -2295,6 +2366,14 @@ class DNSResolver:
         if not self._dnssec_raw_anchors:
             raise Exception("DNSSEC trust anchors missing")
 
+        try:
+            message = dns.message.from_wire(response_wire)
+        except Exception as exc:
+            self.logger.warning("Malformed DNS response during DNSSEC validation for %s: %s", qname, exc)
+            return False, False
+        if not any(rr.rdtype == dns.rdatatype.RRSIG for rr in message.answer):
+            return False, await self._is_proven_insecure_name(qname)
+
         validation_counter = 0
         max_validations = self.dnssec_max_validations if self.dnssec_max_validations > 0 else 999999
 
@@ -2303,7 +2382,7 @@ class DNSResolver:
             msg = dns.message.from_wire(response_wire)
             has_rrsig = any(rr.rdtype == dns.rdatatype.RRSIG for rr in msg.answer)
             if not has_rrsig:
-                return False, True
+                return False, False
 
             for rrset in msg.answer:
                 if rrset.rdtype == dns.rdatatype.RRSIG:
@@ -2322,9 +2401,9 @@ class DNSResolver:
 
                 validation_counter += 1
                 if validation_counter > max_validations:
-                    self.logger.warning("DNSSEC validation limit (%d) exceeded for %s, treating as insecure",
+                    self.logger.warning("DNSSEC validation limit (%d) exceeded for %s; refusing to validate",
                                         max_validations, qname)
-                    return False, True
+                    return False, False
 
                 dns.dnssec.validate(rrset, sig, self._dnssec_raw_anchors)
 
@@ -2342,7 +2421,7 @@ class DNSResolver:
             return secure, insecure
         except asyncio.TimeoutError:
             self.logger.warning("DNSSEC validation timeout for %s after %.1fs", qname, self.dnssec_validation_timeout)
-            return False, True
+            return False, False
         except dns.dnssec.ValidationFailure as e:
             self.logger.warning("DNSSEC validation bogus for %s: %s", qname, e)
             raise
@@ -2795,7 +2874,7 @@ class DNSResolver:
 
             if existing_future:
                 try:
-                    resp = await existing_future
+                    resp = await asyncio.shield(existing_future)
                     normalized = self._normalize_response_edns(resp, msg, do_flag)
                     return self._set_query_id(normalized, orig_id)
                 except Exception as e:
@@ -2893,6 +2972,10 @@ class DNSResolver:
                 future.set_result(response)
             return response
 
+        except asyncio.CancelledError:
+            if not future.done():
+                future.set_exception(RuntimeError("DNS query leader was cancelled"))
+            raise
         except Exception as e:
             # Set the future exception before raising
             if not future.done():

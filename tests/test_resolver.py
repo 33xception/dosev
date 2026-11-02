@@ -384,6 +384,7 @@ async def test_forward_strips_ecs_when_disabled_advanced(resolver):
 async def test_dnssec_unsigned_domain_is_insecure(resolver):
     resolver.dnssec_enabled = True
     resolver._dnssec_raw_anchors = {dns.name.root: b"dummy"}
+    resolver._is_proven_insecure_name = AsyncMock(return_value=True)
 
     qname = "example.com"
     msg = dns.message.make_response(dns.message.make_query(qname, "A"))
@@ -1265,7 +1266,7 @@ async def test_dnssec_validation_limit_exceeded():
         with patch('time.time', return_value=1893456000):
             secure, insecure = await resolver._dnssec_validate("example.com", resp.to_wire(), dnssec_requested=True)
             assert secure is False
-            assert insecure is True
+            assert insecure is False
 
 
 @pytest.mark.asyncio
@@ -1297,7 +1298,7 @@ async def test_dnssec_validation_timeout():
         with patch('time.time', return_value=1893456000):
             secure, insecure = await resolver._dnssec_validate("example.com", resp.to_wire(), dnssec_requested=True)
             assert secure is False
-            assert insecure is True
+            assert insecure is False
 
 
 @pytest.mark.asyncio
