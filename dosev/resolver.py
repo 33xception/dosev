@@ -73,6 +73,7 @@ try:
     import dns.rdtypes.ANY.DS
     import dns.rdtypes.ANY.DNSKEY
     import dns.exception
+    from dns.exception import UnsupportedAlgorithm
     from dns.rdtypes.ANY.NSEC3 import NSEC3
     from dns.rdtypes.ANY.DS import DS
     from dns.rdtypes.ANY.DNSKEY import DNSKEY
@@ -2412,7 +2413,11 @@ class DNSResolver:
                     _CRYPTO_EXECUTOR,
                     lambda: dns.dnssec.validate_rrsig(rrset, sig_rdata, {signer_name_obj: key_rrset})
                 )
-            except dns.dnssec.ValidationFailure as e:
+            except (dns.dnssec.ValidationFailure, UnsupportedAlgorithm) as e:
+                # RFC 4035 Section 5.3.2: unknown algorithms should be treated as insecure, not bogus
+                if isinstance(e, UnsupportedAlgorithm):
+                    self.logger.debug("DNSSEC validation: unsupported algorithm for %s, signer=%s", rrset.name, signer_name)
+                    return False, await self._is_proven_insecure_name(qname)
                 # If signer is root, try validating with configured anchors; otherwise propagate the failure.
                 if (signer_name == "." or signer_name == "") and self._dnssec_raw_anchors:
                     try:
@@ -2420,7 +2425,10 @@ class DNSResolver:
                             _CRYPTO_EXECUTOR,
                             lambda: dns.dnssec.validate_rrsig(rrset, sig_rdata, self._dnssec_raw_anchors)
                         )
-                    except dns.dnssec.ValidationFailure:
+                    except (dns.dnssec.ValidationFailure, UnsupportedAlgorithm) as e2:
+                        if isinstance(e2, UnsupportedAlgorithm):
+                            self.logger.debug("DNSSEC validation: unsupported algorithm for root signer %s", rrset.name)
+                            return False, await self._is_proven_insecure_name(qname)
                         self.logger.warning("RRSIG validation against root anchors failed for %s", rrset.name)
                         raise
                 else:
@@ -2504,6 +2512,10 @@ class DNSResolver:
         except asyncio.TimeoutError:
             self.logger.warning("DNSSEC validation timeout for %s after %.1fs", qname, self.dnssec_validation_timeout)
             return False, False
+        except UnsupportedAlgorithm as e:
+            # RFC 4035 Section 5.3.2: unknown algorithms should be treated as insecure, not bogus
+            self.logger.debug("DNSSEC validation: unsupported algorithm for %s: %s", qname, e)
+            return False, True
         except dns.dnssec.ValidationFailure as e:
             self.logger.warning("DNSSEC validation bogus for %s: %s", qname, e)
             raise
