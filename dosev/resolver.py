@@ -387,7 +387,7 @@ class H3DohProtocol(QuicConnectionProtocol):
                     if waiter and not waiter.done():
                         waiter.set_result(self._request_events.pop(stream_id, deque()))
 
-    async def send_request(self, data: bytes, hostname: str, path: str = "/dns-query") -> bytes:
+    async def send_request(self, data: bytes, hostname: str, path: str = "/dns-query") -> Tuple[bytes, int]:
         if self._http is None:
             self._http = H3Connection(self._quic)
 
@@ -420,10 +420,15 @@ class H3DohProtocol(QuicConnectionProtocol):
             self._request_waiter.pop(stream_id, None)
 
         body = bytearray()
+        age = 0
         for event in events:
             if isinstance(event, DataReceived):
                 body.extend(event.data)
-        return bytes(body)
+            elif isinstance(event, HeadersReceived):
+                for name, value in event.headers:
+                    if name.lower() == b"age":
+                        age = self._parse_http_age(value.decode("ascii", errors="ignore"))
+        return bytes(body), age
 
     def close(self) -> None:
         if self._quic:
@@ -1252,17 +1257,26 @@ class DNSResolver:
     async def _negative_cache_get(self, key: Tuple[str, int, str]) -> Optional[bytes]:
         try:
             if self._cache_is_sync:
-                return self._negative_cache.get(key)
-            return await self._negative_cache.get(key)
+                value = self._negative_cache.get(key)
+            else:
+                value = await self._negative_cache.get(key)
+            if isinstance(value, tuple) and len(value) == 2:
+                response, stored_at = value
+                return self._decrement_response_ttls(response, max(0, int(time.time() - stored_at)))
+            return value
         except Exception:
             return None
 
     async def _negative_cache_set(self, key: Tuple[str, int, str], value: bytes, ttl: Optional[int] = None) -> None:
         try:
+            effective_ttl = self.negative_cache_ttl if ttl is None else int(ttl)
+            if effective_ttl <= 0:
+                return
+            cache_value = (self._set_response_ttl(value, effective_ttl), time.time())
             if self._cache_is_sync:
-                self._negative_cache[key] = value
+                self._negative_cache[key] = cache_value
             else:
-                await self._negative_cache.set(key, value, ttl=ttl)
+                await self._negative_cache.set(key, cache_value, ttl=effective_ttl)
         except Exception:
             pass
 
@@ -1284,7 +1298,11 @@ class DNSResolver:
             msg = dns.message.from_wire(response_bytes)
             if msg.rcode() == dns.rcode.NXDOMAIN:
                 return True
-            return msg.rcode() == dns.rcode.NOERROR and not msg.answer
+            if msg.rcode() != dns.rcode.NOERROR or msg.answer:
+                return False
+            has_soa = any(rrset.rdtype == dns.rdatatype.SOA for rrset in msg.authority)
+            has_ns = any(rrset.rdtype == dns.rdatatype.NS for rrset in msg.authority)
+            return has_soa or not has_ns
         except Exception:
             return False
 
@@ -1324,9 +1342,12 @@ class DNSResolver:
                     ttl = self._extract_min_ttl(resp)
                     if ttl <= 0:
                         return
+                    safe_response = self._cache_safe_response(resp)
+                    if safe_response is None:
+                        return
                     expiry = time.time() + ttl
                     stale_until = expiry + self.stale_max_age if self.optimistic_cache_enabled else expiry
-                    val = (resp, expiry, query_data, stale_until, dnssec_ok)
+                    val = (safe_response, expiry, query_data, stale_until, dnssec_ok)
                     async with self._cache_lock:
                         await self._wire_cache_set(key, val)
                     self.logger.debug("stale refresh succeeded for %s from %s", key, upstream['address'])
@@ -1423,20 +1444,62 @@ class DNSResolver:
                 if request_used_ecs or option.otype != dns.edns.ECS
             ]
             ednsflags = response.ednsflags
+            response_rcode = response.rcode()
             if client_requested_do:
                 ednsflags |= dns.flags.DO
             else:
                 ednsflags &= ~dns.flags.DO
+            response_edns = response.edns if response.edns >= 0 else 0
             response.use_edns(
-                edns=request.edns,
+                edns=response_edns,
                 ednsflags=ednsflags,
                 payload=request.payload,
                 options=options,
             )
+            response.set_rcode(response_rcode)
             return response.to_wire()
         except Exception as e:
             self.logger.debug("Response EDNS normalization failed: %s", e)
             return response_bytes
+
+    @staticmethod
+    def _parse_http_age(value: Any) -> int:
+        if isinstance(value, bytes):
+            value = value.decode("ascii", errors="ignore")
+        if not isinstance(value, str):
+            return 0
+        value = value.strip()
+        if not value.isascii() or not value.isdigit():
+            return 0
+        return int(value)
+
+    def _apply_doh_age(self, response_bytes: bytes, age: int) -> bytes:
+        return self._decrement_response_ttls(response_bytes, age)
+
+    def _decrement_response_ttls(self, response_bytes: bytes, elapsed: int) -> bytes:
+        if elapsed <= 0:
+            return response_bytes
+        try:
+            message = dns.message.from_wire(response_bytes)
+            for section in (message.answer, message.authority, message.additional):
+                for rrset in section:
+                    if rrset.rdtype != dns.rdatatype.OPT:
+                        rrset.ttl = max(0, rrset.ttl - elapsed)
+            return message.to_wire()
+        except Exception as exc:
+            self.logger.debug("Could not decrement DNS TTLs: %s", exc)
+            return response_bytes
+
+    def _cache_safe_response(self, response_bytes: bytes) -> Optional[bytes]:
+        try:
+            message = dns.message.from_wire(response_bytes)
+            if any(option.otype != dns.edns.ECS for option in message.options):
+                return None
+            if message.edns >= 0:
+                message.use_edns(edns=None)
+            return message.to_wire()
+        except Exception:
+            return None
 
     # ---------- parsing helpers ----------
     @staticmethod
@@ -2722,6 +2785,7 @@ class DNSResolver:
         orig_id = msg.id
         cd_flag = bool(msg.flags & dns.flags.CD)
         do_flag = bool(msg.ednsflags & dns.flags.DO) if msg.edns is not None else False
+        cacheable_request = not msg.options
 
         # 3. Hosts override (local A/AAAA)
         host_entry = await self.get_host_for(qname)
@@ -2829,7 +2893,7 @@ class DNSResolver:
         global_cache_key = (qname.lower(), qtype, f"{cache_context}global")
 
         # 6. Negative cache lookup
-        neg_entry = await self._negative_cache_get(cache_key)
+        neg_entry = await self._negative_cache_get(cache_key) if cacheable_request else None
         if neg_entry is not None:
             self.logger.debug("Negative-cache hit for %s", qname)
             normalized = self._normalize_response_edns(neg_entry, msg, do_flag)
@@ -2838,8 +2902,8 @@ class DNSResolver:
         forward_data = forward_msg.to_wire()
 
         # 8. Scope-aware wire cache lookup (positive)
-        cached_entry = await self._wire_cache_get_valid(cache_key)
-        if cached_entry is None and cache_key != global_cache_key:
+        cached_entry = await self._wire_cache_get_valid(cache_key) if cacheable_request else None
+        if cacheable_request and cached_entry is None and cache_key != global_cache_key:
             cached_entry = await self._wire_cache_get_valid(global_cache_key)
 
         if cached_entry is not None:
@@ -2855,34 +2919,34 @@ class DNSResolver:
             do_flag, cd_flag, validate_dnssec, client_subnet_key,
         )
         
-        while True:
-            existing_future = None
-            future = None
-            
-            async with self._flight_lock:
-                existing_future = self._flights.get(flight_key)
-                if existing_future and not existing_future.done():
-                    self.logger.debug("Coalescing flight for %s", qname)
-                else:
-                    existing_future = None
-                    future = asyncio.get_running_loop().create_future()
-                    future.add_done_callback(
-                        lambda completed: completed.exception()
-                        if not completed.cancelled() else None
-                    )
-                    self._flights[flight_key] = future
+        future = None
+        if cacheable_request:
+            while True:
+                existing_future = None
 
-            if existing_future:
-                try:
-                    resp = await asyncio.shield(existing_future)
-                    normalized = self._normalize_response_edns(resp, msg, do_flag)
-                    return self._set_query_id(normalized, orig_id)
-                except Exception as e:
-                    self.logger.debug("Coalesced flight failed: %s", e)
-                    continue
-            
-            # We are the leader; exit the loop
-            break
+                async with self._flight_lock:
+                    existing_future = self._flights.get(flight_key)
+                    if existing_future and not existing_future.done():
+                        self.logger.debug("Coalescing flight for %s", qname)
+                    else:
+                        existing_future = None
+                        future = asyncio.get_running_loop().create_future()
+                        future.add_done_callback(
+                            lambda completed: completed.exception()
+                            if not completed.cancelled() else None
+                        )
+                        self._flights[flight_key] = future
+
+                if existing_future:
+                    try:
+                        resp = await asyncio.shield(existing_future)
+                        normalized = self._normalize_response_edns(resp, msg, do_flag)
+                        return self._set_query_id(normalized, orig_id)
+                    except Exception as e:
+                        self.logger.debug("Coalesced flight failed: %s", e)
+                        continue
+
+                break
 
         # At this point, we are the "leader" – we must set the future result/exception.
         try:
@@ -2908,7 +2972,8 @@ class DNSResolver:
                 qname,
                 validate_dnssec,
                 cache_key,
-                orig_id
+                orig_id,
+                cacheable_request=cacheable_request,
             )
 
             returned_scope = 0
@@ -2945,14 +3010,19 @@ class DNSResolver:
                 response = self._strip_ipv6_records(response)
 
             # 15. Cache the response (positive or negative)
-            if self._is_negative_response(response):
+            if cacheable_request and self._is_negative_response(response):
                 ttl = self._extract_soa_minimum(response)
-                if ttl is None:
-                    ttl = self.negative_cache_ttl
-                await self._negative_cache_set(cache_key, response, ttl=ttl)
-            elif dns.message.from_wire(response).rcode() == dns.rcode.NOERROR:
+                safe_response = self._cache_safe_response(response)
+                if ttl is not None and safe_response is not None:
+                    await self._negative_cache_set(
+                        cache_key, safe_response, ttl=min(ttl, self.negative_cache_ttl)
+                    )
+            elif cacheable_request and dns.message.from_wire(response).rcode() == dns.rcode.NOERROR:
                 try:
-                    resp_msg = dns.message.from_wire(response)
+                    safe_response = self._cache_safe_response(response)
+                    if safe_response is None:
+                        raise ValueError("response contains uncacheable EDNS options")
+                    resp_msg = dns.message.from_wire(safe_response)
                     min_ttl = min(
                         (rr.ttl for sec in (resp_msg.answer, resp_msg.authority, resp_msg.additional)
                         for rr in sec if rr.rdtype != dns.rdatatype.OPT),
@@ -2962,23 +3032,23 @@ class DNSResolver:
                     if min_ttl > 0:
                         expiry = time.time() + min_ttl
                         stale_until = expiry + self.stale_max_age if self.optimistic_cache_enabled else expiry
-                        val = (response, expiry, forward_data, stale_until, validate_dnssec)
+                        val = (safe_response, expiry, forward_data, stale_until, validate_dnssec)
                         await self._wire_cache_set(final_key, val)
                 except Exception as e:
                     self.logger.debug("Cache set error: %s", e)
 
             # 16. Set the future result (for any concurrent waiters) and return
-            if not future.done():
+            if future is not None and not future.done():
                 future.set_result(response)
             return response
 
         except asyncio.CancelledError:
-            if not future.done():
+            if future is not None and not future.done():
                 future.set_exception(RuntimeError("DNS query leader was cancelled"))
             raise
         except Exception as e:
             # Set the future exception before raising
-            if not future.done():
+            if future is not None and not future.done():
                 future.set_exception(e)
             raise
         finally:
@@ -3053,12 +3123,14 @@ class DNSResolver:
     # ---------- Fixed parallel strategy ----------
     async def _execute_strategy(self, strategy: str, upstream_list: List[Dict[str, Any]],
                                 data: bytes, qname: str, dnssec_requested: bool,
-                                key, orig_id: int) -> bytes:
+                                key, orig_id: int, cacheable_request: bool = True) -> bytes:
         last_exc = None
         if strategy == 'failover':
             for upstream in upstream_list:
                 try:
-                    return await self._process_upstream_response(upstream, data, qname, dnssec_requested, key, orig_id)
+                    return await self._process_upstream_response(
+                        upstream, data, qname, dnssec_requested, key, orig_id, cacheable_request
+                    )
                 except Exception as e:
                     last_exc = e
                     self.logger.debug("upstream %s failed: %s", upstream.get('address'), e)
@@ -3069,7 +3141,9 @@ class DNSResolver:
             semaphore = asyncio.Semaphore(5)
             async def bounded_task(upstream):
                 async with semaphore:
-                    return await self._process_upstream_response(upstream, data, qname, dnssec_requested, key, orig_id)
+                    return await self._process_upstream_response(
+                        upstream, data, qname, dnssec_requested, key, orig_id, cacheable_request
+                    )
             tasks = [asyncio.create_task(bounded_task(upstream)) for upstream in upstream_list]
             pending = set(tasks)
             try:
@@ -3100,7 +3174,9 @@ class DNSResolver:
             import random
             upstream = random.choice(upstream_list)
             try:
-                return await self._process_upstream_response(upstream, data, qname, dnssec_requested, key, orig_id)
+                return await self._process_upstream_response(
+                    upstream, data, qname, dnssec_requested, key, orig_id, cacheable_request
+                )
             except Exception as e:
                 last_exc = e
                 self.logger.debug("random upstream %s failed: %s", upstream.get('address'), e)
@@ -3111,7 +3187,9 @@ class DNSResolver:
             upstream = upstream_list[idx]
             self._rr_index += 1
             try:
-                return await self._process_upstream_response(upstream, data, qname, dnssec_requested, key, orig_id)
+                return await self._process_upstream_response(
+                    upstream, data, qname, dnssec_requested, key, orig_id, cacheable_request
+                )
             except Exception as e:
                 last_exc = e
                 self.logger.debug("roundrobin upstream %s failed: %s", upstream.get('address'), e)
@@ -3121,7 +3199,8 @@ class DNSResolver:
 
     async def _process_upstream_response(self, upstream: Dict[str, Any], data: bytes,
                                          qname: str, dnssec_requested: bool,
-                                         key, orig_id: int) -> bytes:
+                                         key, orig_id: int,
+                                         cacheable_request: bool = True) -> bytes:
         resp = await self._try_upstream(upstream, data)
 
         if self.metrics_enabled and self._metrics:
@@ -3156,11 +3235,13 @@ class DNSResolver:
 
         if self._is_negative_response(resp):
             ttl = self._extract_soa_minimum(resp)
-            if ttl is None:
-                ttl = self.negative_cache_ttl
+            safe_response = self._cache_safe_response(resp) if cacheable_request else None
             async with self._cache_lock:
                 await self._wire_cache_delete(key)
-                await self._negative_cache_set(key, resp, ttl=ttl)
+                if ttl is not None and safe_response is not None:
+                    await self._negative_cache_set(
+                        key, safe_response, ttl=min(ttl, self.negative_cache_ttl)
+                    )
             return self._set_query_id(resp, orig_id)
 
         if dns.message.from_wire(resp).rcode() != dns.rcode.NOERROR:
@@ -3171,10 +3252,12 @@ class DNSResolver:
             return self._set_query_id(resp, orig_id)
         expiry = time.time() + ttl
         stale_until = expiry + self.stale_max_age if self.optimistic_cache_enabled else expiry
-        val = (resp, expiry, data, stale_until, dnssec_ok)
-        async with self._cache_lock:
-            await self._negative_cache_delete(key)
-            await self._wire_cache_set(key, val)
+        safe_response = self._cache_safe_response(resp) if cacheable_request else None
+        if safe_response is not None:
+            val = (safe_response, expiry, data, stale_until, dnssec_ok)
+            async with self._cache_lock:
+                await self._negative_cache_delete(key)
+                await self._wire_cache_set(key, val)
 
         return self._set_query_id(resp, orig_id)
 
@@ -3575,7 +3658,7 @@ class DNSResolver:
 
             content_length: Optional[int] = None
             chunked = False
-            content_type_ok = False
+            age = 0
             while True:
                 line = await asyncio.wait_for(reader.readline(), timeout=self.doh_timeout)
                 if not line:
@@ -3593,8 +3676,8 @@ class DNSResolver:
                             content_length = None
                     if k == "transfer-encoding" and "chunked" in v.lower():
                         chunked = True
-                    if k == "content-type" and "application/dns-message" in v.lower():
-                        content_type_ok = True
+                    if k == "age":
+                        age = self._parse_http_age(v)
 
             if chunked:
                 body = bytearray()
@@ -3615,13 +3698,13 @@ class DNSResolver:
                     await asyncio.wait_for(reader.readexactly(2), timeout=self.doh_timeout)
                 body_bytes = bytes(body)
                 self._validate_response_question(data, body_bytes, "DoH")
-                return body_bytes
+                return self._apply_doh_age(body_bytes, age)
             else:
                 if content_length is None:
                     raise Exception("DoH response missing Content-Length and not chunked")
                 body_bytes = await asyncio.wait_for(reader.readexactly(content_length), timeout=self.doh_timeout)
                 self._validate_response_question(data, body_bytes, "DoH")
-                return body_bytes
+                return self._apply_doh_age(body_bytes, age)
         finally:
             writer.close()
             await writer.wait_closed()
@@ -3661,6 +3744,7 @@ class DNSResolver:
                 raise Exception(f"HTTP/2 upstream returned status {resp.status_code}")
             result = resp.content
             self._validate_response_question(data, result, "DoH")
+            result = self._apply_doh_age(result, self._parse_http_age(resp.headers.get("age")))
             await self._h2_pool.put(key, client)
             return result
         except Exception:
@@ -3705,8 +3789,13 @@ class DNSResolver:
                 raise
 
         try:
-            response = await client.send_request(data, hostname, path)
+            result = await client.send_request(data, hostname, path)
+            if isinstance(result, tuple):
+                response, age = result
+            else:
+                response, age = result, 0
             self._validate_response_question(data, response, "DoH")
+            response = self._apply_doh_age(response, age)
             # Success: return connection to pool
             await self._h3_pool.put(key, client)
             return response
@@ -3738,6 +3827,13 @@ class DNSResolver:
             raise
 
     # ---------- DOQ with connection pooling and fragmentation fix ----------
+    def _close_doq_protocol_error(self, client: Any, reason: str) -> None:
+        try:
+            client._quic.close(error_code=0x2, reason_phrase=reason)
+            client.transmit()
+        except Exception as exc:
+            self.logger.debug("Could not close DoQ connection with protocol error: %s", exc)
+
     async def _forward_quic(self, data: bytes, upstream: Dict[str, Any]) -> bytes:
         """Forward DNS query over QUIC (DoQ)."""
         if not _HAS_AIOQUIC:
@@ -3752,6 +3848,10 @@ class DNSResolver:
         port = upstream.get('port', 853)
         hostname = upstream.get('hostname', host)
         ip_override = upstream.get('ip')
+        if len(data) < 12:
+            raise ValueError("DoQ query is shorter than a DNS header")
+        original_id = int.from_bytes(data[:2], 'big')
+        doq_query = b"\x00\x00" + data[2:]
 
         resolved = await self._resolve_upstream_ip(host, ip_override)
         if self.disable_ipv6 and self._is_ipv6_address(resolved):
@@ -3815,7 +3915,7 @@ class DNSResolver:
             # DoQ format: 2-byte length prefix + DNS message
             client._quic.send_stream_data(
                 stream_id,
-                len(data).to_bytes(2, 'big') + data,
+                len(doq_query).to_bytes(2, 'big') + doq_query,
                 end_stream=True
             )
             client.transmit()
@@ -3848,24 +3948,26 @@ class DNSResolver:
                 client._fragments.pop(stream_id, None)
 
             if len(response_data) < 2:
-                raise Exception("Invalid DoQ response (too short)")
+                self._close_doq_protocol_error(client, "DoQ response missing length prefix")
+                raise OSError("Invalid DoQ response (too short)")
             resp_len = int.from_bytes(response_data[:2], 'big')
-            if resp_len + 2 > len(response_data):
-                raise Exception("DoQ response truncated")
+            if resp_len + 2 != len(response_data) or resp_len < 12:
+                self._close_doq_protocol_error(client, "Invalid DoQ response framing")
+                raise OSError("Invalid DoQ response framing")
             resp = response_data[2:2+resp_len]
 
-            # RFC 9250: Validate Transaction ID matches query
-            if len(resp) >= 2 and len(data) >= 2:
-                resp_id = int.from_bytes(resp[:2], 'big')
-                sent_id = int.from_bytes(data[:2], 'big')
-                if resp_id != sent_id:
-                    self.logger.warning("DoQ response ID mismatch: sent %d, got %d", sent_id, resp_id)
-                    raise OSError("DoQ Response ID mismatch")
+            if resp[:2] != b"\x00\x00":
+                self._close_doq_protocol_error(client, "DoQ DNS Message ID is not zero")
+                raise OSError("DoQ response DNS Message ID must be zero")
 
-            self._validate_response_question(data, resp, "DoQ")
+            try:
+                self._validate_response_question(doq_query, resp, "DoQ")
+            except OSError:
+                self._close_doq_protocol_error(client, "DoQ response question mismatch")
+                raise
             # Store in pool on success
             await self._quic_pool.put(key, client)
-            return resp
+            return self._set_query_id(resp, original_id)
 
         except asyncio.CancelledError:
             # Clean up the connection on cancellation (e.g., health-check timeout)
@@ -4013,10 +4115,13 @@ class DNSResolver:
     def _extract_soa_minimum(self, response: bytes) -> Optional[int]:
         try:
             msg = dns.message.from_wire(response)
+            ttl = None
             for rrset in msg.authority:
                 if rrset.rdtype == dns.rdatatype.SOA:
                     for rr in rrset:
-                        return rr.minimum
+                        candidate = min(rrset.ttl, rr.minimum)
+                        ttl = candidate if ttl is None else min(ttl, candidate)
+            return ttl
         except Exception:
             pass
         return None

@@ -246,6 +246,10 @@ async def test_integration_nxdomain_caching(mock_dns_server):
             msg = dns.message.from_wire(data)
             resp = dns.message.make_response(msg)
             resp.set_rcode(dns.rcode.NXDOMAIN)
+            resp.authority.append(dns.rrset.from_text(
+                "example.", 60, dns.rdataclass.IN, dns.rdatatype.SOA,
+                "ns.example. hostmaster.example. 1 3600 600 86400 60"
+            ))
             return resp.to_wire()
         except Exception:
             return b""

@@ -305,21 +305,24 @@ async def test_doq_connection_pool_reuse():
         query_id = query_wire[:2]
 
         resp = dns.message.make_response(query)
+        resp.id = 0
         rr = dns.rrset.from_text("example.com.", 60, dns.rdataclass.IN, dns.rdatatype.A, "192.0.2.1")
         resp.answer.append(rr)
         response_wire = resp.to_wire()
-        # Ensure response has same ID as query
-        response_wire = query_id + response_wire[2:]
         response_data = len(response_wire).to_bytes(2, 'big') + response_wire
 
         with patch("asyncio.wait_for", new=AsyncMock(return_value=response_data)):
             upstream = resolver.upstreams[0]
             result1 = await resolver._forward_quic(query_wire, upstream)
-            assert result1 == response_wire
+            expected_response = query_id + response_wire[2:]
+            assert result1 == expected_response
+            sent_message = mock_client._quic.send_stream_data.call_args.args[1][2:]
+            assert sent_message[:2] == b"\x00\x00"
+            assert sent_message[2:] == query_wire[2:]
             assert mock_connect.call_count == 1
 
             result2 = await resolver._forward_quic(query_wire, upstream)
-            assert result2 == response_wire
+            assert result2 == expected_response
             assert mock_connect.call_count == 1
 
 
@@ -356,20 +359,55 @@ async def test_doq_connection_pool_closed_connection():
             query_id = query_wire[:2]
 
             resp = dns.message.make_response(query)
+            resp.id = 0
             resp.answer.append(dns.rrset.from_text("example.com.", 60, dns.rdataclass.IN, dns.rdatatype.A, "192.0.2.1"))
             response_wire = resp.to_wire()
-            response_wire = query_id + response_wire[2:]
             response_data = len(response_wire).to_bytes(2, 'big') + response_wire
 
             with patch("asyncio.wait_for", new=AsyncMock(return_value=response_data)):
                 upstream = resolver.upstreams[0]
                 result1 = await resolver._forward_quic(query_wire, upstream)
-                assert result1 == response_wire
+                expected_response = query_id + response_wire[2:]
+                assert result1 == expected_response
                 assert mock_connect.call_count == 1
 
                 result2 = await resolver._forward_quic(query_wire, upstream)
-                assert result2 == response_wire
+                assert result2 == expected_response
                 assert mock_connect.call_count == 2
+
+
+@pytest.mark.asyncio
+async def test_doq_nonzero_response_id_closes_with_protocol_error():
+    resolver = DNSResolver(upstreams=[{"address": "example.com", "protocol": "quic", "port": 853}])
+    client = MockQuicClient(closed=False)
+    client.wait_connected = AsyncMock(return_value=None)
+
+    class CM:
+        async def __aenter__(self):
+            return client
+
+        async def __aexit__(self, *args):
+            return None
+
+    query = dns.message.make_query("example.com", "A")
+    query_wire = query.to_wire()
+    response = dns.message.make_response(query)
+    response.answer.append(dns.rrset.from_text(
+        "example.com.", 60, dns.rdataclass.IN, dns.rdatatype.A, "192.0.2.1"
+    ))
+    response_wire = response.to_wire()
+    response_data = len(response_wire).to_bytes(2, "big") + response_wire
+
+    with patch("aioquic.asyncio.connect", return_value=CM()):
+        with patch("asyncio.wait_for", new=AsyncMock(return_value=response_data)):
+            with pytest.raises(OSError, match="DNS Message ID must be zero"):
+                await resolver._forward_quic(query_wire, resolver.upstreams[0])
+
+    sent_message = client._quic.send_stream_data.call_args.args[1][2:]
+    assert sent_message[:2] == b"\x00\x00"
+    client._quic.close.assert_called_once_with(
+        error_code=0x2, reason_phrase="DoQ DNS Message ID is not zero"
+    )
 
 
 @pytest.mark.asyncio

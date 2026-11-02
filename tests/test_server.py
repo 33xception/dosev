@@ -9,7 +9,7 @@ import ssl
 import types
 import pytest
 from aiohttp import web
-from unittest.mock import AsyncMock
+from unittest.mock import AsyncMock, MagicMock
 import dns.message
 
 from dosev.server import run_server, run_server_sync, reload_resolver, ResolverHolder, UDPResolverProtocol, _handle_doh_request, _drop_dns_privileges, _tcp_handler
@@ -37,6 +37,21 @@ class FakeTCPServer:
 
     async def wait_closed(self):
         pass
+
+
+@pytest.mark.asyncio
+async def test_udp_client_payload_is_clamped_to_512_bytes():
+    resolver = DNSResolver()
+    resolver.forward_dns_query = AsyncMock(return_value=b"x" * 513)
+    resolver._set_tc_bit = MagicMock(return_value=b"truncated")
+    protocol = UDPResolverProtocol(ResolverHolder(resolver))
+    protocol.transport = MagicMock()
+    query = dns.message.make_query("example.com", "A")
+    query.use_edns(payload=1)
+
+    await protocol._handle(query.to_wire(), ("127.0.0.1", 53000))
+
+    resolver._set_tc_bit.assert_called_once_with(b"x" * 513, 512)
 
 
 @pytest.mark.asyncio

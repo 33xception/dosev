@@ -169,6 +169,10 @@ async def test_forward_dns_query_negative_responses_are_cached(monkeypatch):
         req = dns.message.from_wire(data)
         resp = dns.message.make_response(req)
         resp.set_rcode(dns.rcode.NXDOMAIN)
+        resp.authority.append(dns.rrset.from_text(
+            "example.", 30, "IN", "SOA",
+            "ns.example. hostmaster.example. 1 3600 600 86400 60"
+        ))
         return resp.to_wire()
 
     monkeypatch.setattr(resolver, "_try_upstream", fake_try_upstream)
@@ -204,6 +208,45 @@ async def test_forward_dns_query_does_not_cache_servfail(monkeypatch):
     assert calls == 2
     assert dns.message.from_wire(first).rcode() == dns.rcode.SERVFAIL
     assert dns.message.from_wire(second).rcode() == dns.rcode.SERVFAIL
+
+
+@pytest.mark.asyncio
+async def test_negative_cache_decrements_ttl_and_uses_soa_bounds():
+    resolver = DNSResolver(negative_cache_ttl=60)
+    query = dns.message.make_query("example.com", "A")
+    response = dns.message.make_response(query)
+    response.set_rcode(dns.rcode.NXDOMAIN)
+    response.authority.append(dns.rrset.from_text(
+        "example.com.", 90, "IN", "SOA",
+        "ns.example.com. hostmaster.example.com. 1 3600 600 86400 60"
+    ))
+    key = ("example.com.", dns.rdatatype.A, "global")
+
+    assert resolver._extract_soa_minimum(response.to_wire()) == 60
+    with patch("time.time", return_value=1000):
+        await resolver._negative_cache_set(key, response.to_wire(), ttl=60)
+    with patch("time.time", return_value=1007):
+        cached = await resolver._negative_cache_get(key)
+
+    assert cached is not None
+    assert dns.message.from_wire(cached).authority[0].ttl == 53
+
+
+@pytest.mark.asyncio
+async def test_negative_response_without_soa_is_not_cached(monkeypatch):
+    resolver = DNSResolver(upstreams=[{"address": "127.0.0.1", "protocol": "udp", "ip": "127.0.0.1"}])
+    query = dns.message.make_query("missing.example", "A").to_wire()
+    calls = 0
+
+    async def fake_try_upstream(upstream, data):
+        nonlocal calls
+        calls += 1
+        return dns.message.make_response(dns.message.from_wire(data)).to_wire()
+
+    monkeypatch.setattr(resolver, "_try_upstream", fake_try_upstream)
+    await resolver.forward_dns_query(query)
+    await resolver.forward_dns_query(query)
+    assert calls == 2
 
 
 @pytest.mark.asyncio
@@ -377,6 +420,72 @@ async def test_forward_strips_ecs_when_disabled_advanced(resolver):
     sent = dns.message.from_wire(captured["data"])
     assert sent.opt is not None
     assert sent.options == ()
+
+
+def test_doh_age_decrements_dns_ttls_without_changing_opt_ttl():
+    resolver = DNSResolver()
+    query = dns.message.make_query("example.com", "A")
+    response = dns.message.make_response(query)
+    response.answer.append(dns.rrset.from_text("example.com.", 60, "IN", "A", "192.0.2.1"))
+    response.authority.append(dns.rrset.from_text(
+        "example.com.", 90, "IN", "SOA",
+        "ns.example.com. hostmaster.example.com. 1 3600 600 86400 60"
+    ))
+    response.use_edns(payload=1232)
+
+    aged = dns.message.from_wire(resolver._apply_doh_age(response.to_wire(), 25))
+    assert aged.answer[0].ttl == 35
+    assert aged.authority[0].ttl == 65
+    assert aged.opt.ttl == response.opt.ttl
+
+
+def test_normalized_badvers_keeps_upstream_edns_version():
+    resolver = DNSResolver()
+    query = dns.message.make_query("example.com", "A")
+    query.use_edns(edns=1, payload=1232)
+    response = dns.message.make_response(query)
+    response.use_edns(edns=0, payload=1232)
+    response.set_rcode(dns.rcode.BADVERS)
+
+    normalized = dns.message.from_wire(
+        resolver._normalize_response_edns(response.to_wire(), query, False)
+    )
+    assert normalized.edns == 0
+    assert normalized.rcode() == dns.rcode.BADVERS
+
+
+@pytest.mark.asyncio
+async def test_edns_option_queries_bypass_response_cache(monkeypatch):
+    resolver = DNSResolver(upstreams=[{"address": "127.0.0.1", "protocol": "udp", "ip": "127.0.0.1"}])
+    query = dns.message.make_query("example.com", "A")
+    query.use_edns(options=[dns.edns.GenericOption(65001, b"request")])
+    calls = 0
+
+    async def fake_try_upstream(upstream, data):
+        nonlocal calls
+        calls += 1
+        request = dns.message.from_wire(data)
+        response = dns.message.make_response(request)
+        response.use_edns(options=[dns.edns.GenericOption(65001, b"response")])
+        return response.to_wire()
+
+    monkeypatch.setattr(resolver, "_try_upstream", fake_try_upstream)
+    await resolver.forward_dns_query(query.to_wire())
+    await resolver.forward_dns_query(query.to_wire())
+    assert calls == 2
+
+
+def test_cache_safe_response_drops_opt_and_rejects_other_options():
+    resolver = DNSResolver()
+    query = dns.message.make_query("example.com", "A")
+    response = dns.message.make_response(query)
+    response.use_edns(payload=1232)
+    safe = resolver._cache_safe_response(response.to_wire())
+    assert safe is not None
+    assert dns.message.from_wire(safe).edns == -1
+
+    response.use_edns(options=[dns.edns.GenericOption(65001, b"response")])
+    assert resolver._cache_safe_response(response.to_wire()) is None
 
 
 # ---------- DNSSEC Tests (basic) ----------
@@ -1109,6 +1218,7 @@ async def test_forward_https1_chunked_response():
         b"HTTP/1.1 200 OK\r\n",
         b"Transfer-Encoding: chunked\r\n",
         b"Content-Type: application/dns-message\r\n",
+        b"Age: 20\r\n",
         b"\r\n",
         b"2\r\n",
         str(len(resp) - 2).encode() + b"\r\n",
@@ -1152,7 +1262,7 @@ async def test_forward_https1_chunked_response():
 
     with patch("asyncio.open_connection", side_effect=fake_connect):
         result = await resolver._forward_https1(data, "example.com", 443, "example.com", "/dns-query", None)
-        assert result == resp
+        assert dns.message.from_wire(result).answer[0].ttl == 40
 
 
 @pytest.mark.asyncio
@@ -1198,16 +1308,18 @@ async def test_forward_https2_pool_reuse():
     resp = make_a_response("example.com")
 
     mock_client = AsyncMock()
-    mock_client.post = AsyncMock(return_value=MagicMock(status_code=200, content=resp))
+    mock_client.post = AsyncMock(return_value=MagicMock(
+        status_code=200, content=resp, headers={"age": "20"}
+    ))
     mock_client.aclose = AsyncMock()
 
     with patch("httpx.AsyncClient", return_value=mock_client):
         result = await resolver._forward_https2(data, "example.com", 443, "example.com", "/dns-query", None)
-        assert result == resp
+        assert dns.message.from_wire(result).answer[0].ttl == 40
 
         with patch.object(resolver._h2_pool, "get", new=AsyncMock(return_value=mock_client)):
             result2 = await resolver._forward_https2(data, "example.com", 443, "example.com", "/dns-query", None)
-            assert result2 == resp
+            assert dns.message.from_wire(result2).answer[0].ttl == 40
 
 
 # ---------- DNSSEC Validation Edge Cases ----------
@@ -1616,6 +1728,15 @@ def test_is_negative_response_noanswer():
     query = dns.message.make_query("example.com", "A")
     resp = dns.message.make_response(query)
     assert resolver._is_negative_response(resp.to_wire()) is True
+
+
+def test_is_negative_response_referral_is_not_negative():
+    resolver = DNSResolver()
+    response = dns.message.make_response(dns.message.make_query("child.example", "A"))
+    response.authority.append(dns.rrset.from_text(
+        "example.", 300, "IN", "NS", "ns1.example."
+    ))
+    assert resolver._is_negative_response(response.to_wire()) is False
 
 
 def test_is_negative_response_with_answer():
@@ -2112,14 +2233,14 @@ async def test_forward_quic_uses_ip_override():
 
             query_msg = dns.message.from_wire(data)
             resp = dns.message.make_response(query_msg)
+            resp.id = 0
             resp.answer.append(dns.rrset.from_text("test.com.", 60, dns.rdataclass.IN, dns.rdatatype.A, "192.0.2.1"))
             resp_wire = resp.to_wire()
-            resp_wire = query_id + resp_wire[2:]
             response_data = len(resp_wire).to_bytes(2, 'big') + resp_wire
 
             with patch("asyncio.wait_for", new=AsyncMock(return_value=response_data)):
                 result = await resolver._forward_quic(data, upstream)
-                assert result == resp_wire
+                assert result == query_id + resp_wire[2:]
 
 
 @pytest.mark.asyncio
@@ -2385,8 +2506,8 @@ async def test_forward_tls_txid_validation():
 
 
 @pytest.mark.asyncio
-async def test_forward_quic_txid_validation():
-    """DoQ forward should reject response with mismatched transaction ID."""
+async def test_forward_quic_rejects_nonzero_response_id():
+    """DoQ must reject every upstream response whose DNS Message ID is nonzero."""
     resolver = DNSResolver(
         upstreams=[{"address": "example.com", "protocol": "quic", "port": 853, "hostname": "example.com"}],
         doh_timeout=1.0,
@@ -2406,9 +2527,11 @@ async def test_forward_quic_txid_validation():
         async def wait_connected(self):
             return True
 
+    client = MockQuicClient()
+
     class MockAsyncCM:
         async def __aenter__(self):
-            return MockQuicClient()
+            return client
         async def __aexit__(self, *args):
             pass
 
@@ -2417,7 +2540,7 @@ async def test_forward_quic_txid_validation():
     query.id = 0x1234
     qwire = query.to_wire()
 
-    # Create response with DIFFERENT ID to trigger validation
+    # A nonzero response ID is a DoQ protocol error, regardless of the query ID.
     resp = dns.message.make_response(query)
     resp.id = 0x5678  # Different ID
     resp.answer.append(dns.rrset.from_text("example.com.", 60, dns.rdataclass.IN, dns.rdatatype.A, "192.0.2.1"))
@@ -2427,8 +2550,41 @@ async def test_forward_quic_txid_validation():
     with patch("aioquic.asyncio.connect", return_value=MockAsyncCM()):
         with patch.object(resolver._quic_pool, "get", new=AsyncMock(return_value=None)):
             with patch("asyncio.wait_for", new=AsyncMock(return_value=response_data)):
-                with pytest.raises(OSError, match="DoQ Response ID mismatch"):
+                with pytest.raises(OSError, match="DoQ response DNS Message ID must be zero"):
                     await resolver._forward_quic(qwire, resolver.upstreams[0])
+
+    client._quic.close.assert_called_once_with(
+        error_code=0x2, reason_phrase="DoQ DNS Message ID is not zero"
+    )
+
+
+@pytest.mark.asyncio
+async def test_forward_https3_applies_age_to_dns_ttl():
+    resolver = DNSResolver(
+        upstreams=[{"address": "127.0.0.1", "protocol": "https", "port": 443, "hostname": "example.com", "ip": "127.0.0.1"}]
+    )
+    query = dns.message.make_query("example.com", "A").to_wire()
+    response = make_a_response("example.com")
+
+    class MockH3Client:
+        async def send_request(self, data, hostname, path):
+            return response, 20
+
+    class MockAsyncCM:
+        async def __aenter__(self):
+            return MockH3Client()
+
+        async def __aexit__(self, *args):
+            return None
+
+    with patch("dosev.resolver.connect", return_value=MockAsyncCM()):
+        with patch.object(resolver._h3_pool, "get", new=AsyncMock(return_value=None)):
+            with patch.object(resolver._h3_pool, "put", new=AsyncMock()):
+                result = await resolver._forward_https3(
+                    query, "example.com", 443, "example.com", "/dns-query", "127.0.0.1"
+                )
+
+    assert dns.message.from_wire(result).answer[0].ttl == 40
 
 
 @pytest.mark.asyncio
@@ -2516,8 +2672,7 @@ async def test_single_opt_record_is_accepted():
     
 # ---------- ECS Scope-Aware Caching ----------
 @pytest.mark.asyncio
-async def test_ecs_scope_cache_isolation():
-    """Responses with ECS scope > 0 should be cached with subnet-specific key."""
+async def test_explicit_ecs_requests_bypass_response_cache():
     resolver = DNSResolver(
         upstreams=[{"address": "1.1.1.1", "protocol": "udp", "ip": "1.1.1.1"}],
         ecs_enabled=True,
@@ -2553,19 +2708,7 @@ async def test_ecs_scope_cache_isolation():
 
     await resolver.forward_dns_query(qwire)
 
-    # The cache key should include ECS scope info
-    assert len(cache_keys) >= 1
-    # Find the cache key that was actually used
-    for key in cache_keys:
-        if len(key) == 3 and key[0] == "example.com." and key[1] == dns.rdatatype.A:
-            # With ECS enabled, the scope should be extracted from response
-            # If it's still 'global', the ECS scope wasn't properly extracted
-            # This test verifies the resolver handles ECS scope in cache keys
-            # For now, just verify the cache was used
-            assert True
-            break
-    else:
-        pytest.fail("No matching cache key found")
+    assert cache_keys == []
 
 
 @pytest.mark.asyncio

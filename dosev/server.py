@@ -126,7 +126,7 @@ class UDPResolverProtocol(asyncio.DatagramProtocol):
             try:
                 req_msg = dns.message.from_wire(data)
                 if req_msg.opt:
-                    client_payload = req_msg.payload
+                    client_payload = max(512, req_msg.payload)
             except Exception:
                 pass
             if len(response) > client_payload:
