@@ -157,6 +157,48 @@ All background tasks are tracked in `_background_tasks` for clean shutdown.
 - **chroot**: Optional jail for additional isolation.
 
 ---
+
+## Post-Quantum Readiness
+
+`dosev` includes foundational support for post-quantum cryptography, primarily focused on **transport security** (TLS) to mitigate the harvest-now-decrypt-later threat.
+
+### Transport PQ Status
+
+| Transport | PQ Status | Notes |
+|-----------|-----------|-------|
+| **DoT** (DNS-over-TLS) | classical only | Uses Python's `ssl` module. OpenSSL 3.5+ supports hybrid X25519MLKEM768 groups, but Python's `ssl` does not expose group selection APIs. Requires `OPENSSL_CONF` environment variable workaround. |
+| **DoH 1.1/2** | classical only | Uses `aiohttp` which uses Python's `ssl`. Same limitation as DoT. |
+| **DoH/3** (HTTP/3) | classical only | Uses `aioquic` library (v1.3.0). Currently has only classical groups: X25519, X448, SECP256R1, SECP384R1, SECP521R1, GREASE. No ML-KEM support. |
+| **DoQ** (DNS-over-QUIC) | classical only | Uses `aioquic` library. Same limitation as DoH/3. |
+
+### Configuration
+
+The `[security]` section includes `pqc_mode`:
+- `auto` (default): Logs a startup warning if OpenSSL < 3.5 or group control unavailable
+- `off`: Disables PQ group preference
+
+**Not hot-reloadable**: TLS context cannot be reinitialized after startup.
+
+### Handshake Failure Monitoring
+
+TLS handshake failures are tracked with the Prometheus metric:
+- `dosev_upstream_handshake_failures_total` (labels: `upstream`, `reason`)
+
+Rate-limited warnings (once per 5 minutes per upstream) help diagnose middlebox compatibility issues with oversized ClientHellos (hybrid groups add ~1216 bytes to the key share).
+
+### DNSSEC Considerations
+
+DNSSEC signature validation already handles unknown algorithms correctly per RFC 4035 Section 5.3.2: unsupported algorithms yield **insecure** (not bogus), allowing the response to be served. This prevents PQ algorithm deployment from breaking resolution.
+
+DNSSEC signatures themselves are not currently vulnerable to harvest-now-decrypt-later because:
+1. Validators choose the trust anchor
+2. Signatures are ephemeral and expire
+3. IETF PQ DNSSEC signature algorithms are still at draft stage
+
+See [docs/pqc.md](pqc.md) for detailed configuration and troubleshooting.
+
+---
+
 ## Performance Optimizations
 
 - **Asynchronous I/O**: All network operations are non-blocking.

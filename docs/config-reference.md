@@ -105,6 +105,7 @@ All upstreams are now defined in the `[upstreams]` section (see below).
 | `dnssec_chain_validation` | bool | `true` | Enable the recursive chain-of-trust validation (fetches DS/DNSKEY). If false, falls back to the legacy static validation using only the root anchor. |
 | `dnssec_max_iterations` | int | `100` | Maximum number of iterations (validation steps) to prevent infinite loops (RFC 9276). |
 | `dns_scrub_unsolicited_ns` | bool | `true` | Scrub unsolicited NS records from authority section to prevent cache poisoning (RFC 2181 Section 5.4.1, CVE-2025-11411). |
+| `pqc_mode` | string | `auto` | Post-quantum cryptography mode. `auto`: use PQ groups when available (requires OpenSSL >= 3.5, logs warning if unavailable). `off`: disable PQ groups. **Not hot-reloadable**. |
 | `pinned_certs` | string | `""` | Comma-separated `hostname=sha256` pins for TLS connections. |
 | `rebind_protection` | bool | `false` | Enable rebinding protection. |
 | `rebind_action` | string | `strip` | `strip` or `block` when private IPs are detected. |
