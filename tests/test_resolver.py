@@ -832,7 +832,7 @@ async def test_forward_tcp_pool_reuse():
         writer.drain = AsyncMock()
         return reader, writer
 
-    with patch("asyncio.open_connection", side_effect=fake_connect):
+    with patch.object(resolver, "_open_tcp_connection", side_effect=fake_connect):
         result = await resolver._forward_tcp(data, resolver.upstreams[0])
         assert result == resp
 
@@ -944,7 +944,7 @@ async def test_forward_tcp_closes_new_connection_after_timeout(monkeypatch):
     writer.wait_closed = AsyncMock()
     monkeypatch.setattr(resolver._tcp_pool, "get", AsyncMock(return_value=None))
     monkeypatch.setattr(resolver, "_resolve_upstream_ip", AsyncMock(return_value="127.0.0.1"))
-    monkeypatch.setattr(asyncio, "open_connection", AsyncMock(return_value=(reader, writer)))
+    monkeypatch.setattr(resolver, "_open_tcp_connection", AsyncMock(return_value=(reader, writer)))
 
     with pytest.raises(asyncio.TimeoutError):
         await resolver._forward_tcp(query, resolver.upstreams[0])
@@ -1005,7 +1005,7 @@ async def test_forward_tcp_closed_connection_creates_new():
     resolver._tcp_pool.get = mock_get
     resolver._tcp_pool.put = AsyncMock()
 
-    with patch("asyncio.open_connection", side_effect=fake_connect):
+    with patch.object(resolver, "_open_tcp_connection", side_effect=fake_connect):
         result = await resolver._forward_tcp(data, resolver.upstreams[0])
         assert result == resp_wire
         assert connect_count == 1
@@ -1032,7 +1032,7 @@ async def test_forward_tcp_timeout():
         writer.drain = AsyncMock()
         return reader, writer
 
-    with patch("asyncio.open_connection", side_effect=fake_connect):
+    with patch.object(resolver, "_open_tcp_connection", side_effect=fake_connect):
         with pytest.raises(asyncio.TimeoutError):
             await resolver._forward_tcp(data, resolver.upstreams[0])
 
@@ -2068,11 +2068,12 @@ async def test_forward_tcp_uses_ip_override():
         writer.write = MagicMock()
         writer.is_closing = MagicMock(return_value=False)
 
-        with patch("asyncio.open_connection", new=AsyncMock(return_value=(reader, writer))):
+        with patch.object(resolver, "_open_tcp_connection", new=AsyncMock(return_value=(reader, writer))) as mock_connect:
             with patch.object(resolver, "_resolve_upstream_ip") as mock_resolve:
                 mock_resolve.return_value = "192.0.2.1"
                 result = await resolver._forward_tcp(data, upstream)
                 assert result == resp_wire
+            mock_connect.assert_awaited_once_with("192.0.2.1", 5353)
 
 
 @pytest.mark.asyncio
@@ -2204,7 +2205,7 @@ async def test_tcp_length_validation_zero():
         writer.drain = AsyncMock()
         return reader, writer
 
-    with patch("asyncio.open_connection", side_effect=mock_connect_zero):
+    with patch.object(resolver, "_open_tcp_connection", side_effect=mock_connect_zero):
         with pytest.raises(ValueError, match="TCP message length 0 is less than required DNS header size"):
             await resolver._forward_tcp(b"test", resolver.upstreams[0])
 
@@ -2239,7 +2240,7 @@ async def test_tcp_length_validation_valid():
         writer.drain = AsyncMock()
         return reader, writer
 
-    with patch("asyncio.open_connection", side_effect=mock_connect_valid):
+    with patch.object(resolver, "_open_tcp_connection", side_effect=mock_connect_valid):
         resp = await resolver._forward_tcp(data, resolver.upstreams[0])
         assert resp == resp_wire
 
@@ -2273,7 +2274,7 @@ async def test_tcp_length_validation_max():
         writer.drain = AsyncMock()
         return reader, writer
 
-    with patch("asyncio.open_connection", side_effect=mock_connect_max):
+    with patch.object(resolver, "_open_tcp_connection", side_effect=mock_connect_max):
         resp = await resolver._forward_tcp(data, resolver.upstreams[0])
         assert resp == resp_wire
 
@@ -2304,7 +2305,7 @@ async def test_tcp_length_validation_exceeds_limit():
             writer.drain = AsyncMock()
             return reader, writer
 
-        with patch("asyncio.open_connection", side_effect=mock_connect_too_large):
+        with patch.object(resolver, "_open_tcp_connection", side_effect=mock_connect_too_large):
             with pytest.raises(ValueError, match="TCP message length 101 exceeds maximum 100"):
                 await resolver._forward_tcp(b"test", resolver.upstreams[0])
                 
@@ -2342,7 +2343,7 @@ async def test_forward_tcp_txid_validation():
     query.id = 0x1234
     qwire = query.to_wire()
 
-    with patch("asyncio.open_connection", side_effect=mock_open_connection):
+    with patch.object(resolver, "_open_tcp_connection", side_effect=mock_open_connection):
         with pytest.raises(OSError, match="TCP Response ID mismatch"):
             await resolver._forward_tcp(qwire, resolver.upstreams[0])
 
