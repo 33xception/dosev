@@ -6,6 +6,7 @@ from importlib.metadata import version
 
 from .config import load_config, _default_log_dir, get_default_config_path, write_default_config
 from .server import run_server_sync
+from . import cryptoinfo
 
 def main() -> None:
     default_config = get_default_config_path()
@@ -16,6 +17,8 @@ def main() -> None:
                         help="Validate the configuration and exit without starting the server")
     parser.add_argument("--version", action="store_true",
                         help="Show version and exit")
+    parser.add_argument("--crypto-info", action="store_true",
+                        help="Show crypto environment diagnostics and exit (no config file needed)")
     args = parser.parse_args()
 
     if args.version:
@@ -24,6 +27,11 @@ def main() -> None:
         except Exception:
             ver = "unknown"
         print(f"dosev {ver}")
+        return
+
+    if args.crypto_info:
+        info = cryptoinfo.get_crypto_info()
+        print(cryptoinfo.format_crypto_info(info))
         return
 
     config_path = args.config

@@ -68,3 +68,32 @@ def test_main_version_flag(monkeypatch, capsys):
         assert e.code == 0
     captured = capsys.readouterr()
     assert "dosev 1.6.0" in captured.out
+
+
+def test_main_crypto_info_flag(monkeypatch, capsys):
+    """Test that --crypto-info prints diagnostics and exits without config."""
+    monkeypatch.setattr(sys, "argv", ["dosev", "--crypto-info"])
+
+    try:
+        main()
+    except SystemExit as e:
+        assert e.code == 0
+    captured = capsys.readouterr()
+    assert "Post-Quantum Readiness Diagnostics" in captured.out
+    assert "Python/OpenSSL Environment:" in captured.out
+    assert "Package Versions:" in captured.out
+    assert "Transport PQ Status:" in captured.out
+
+
+def test_main_crypto_info_no_config_file_needed(monkeypatch, capsys):
+    """Test that --crypto-info works without a config file."""
+    # Ensure no config file exists
+    monkeypatch.setattr("dosev.cli.get_default_config_path", lambda: "/nonexistent/path")
+    monkeypatch.setattr(sys, "argv", ["dosev", "--crypto-info"])
+
+    try:
+        main()
+    except SystemExit as e:
+        assert e.code == 0
+    captured = capsys.readouterr()
+    assert "Post-Quantum Readiness Diagnostics" in captured.out
