@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "dosev"
-version = "1.10.1"
+version = "1.11.0"
 description = "Multi‑protocol DNS resolver with full server and config support"
 authors = [{ name = "Mohammad Amin Kiani", email = "mohammadamin.k1390@gmail.com" }]
 license = { text = "MIT" }

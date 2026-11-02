@@ -1,3 +1,13 @@
+# [1.11.0] – 2026-11-02
+
+## Added
+
+- **TCP Fast Open for upstream queries** – Enable RFC 7413 Fast Open by default for new plain TCP upstream connections, with a `tcp_fastopen_enabled` configuration option and ordinary TCP fallback when unsupported or unavailable.
+
+## Fixed
+
+- **TCP Fast Open compatibility** – Fall back to a normal connection when the Fast Open option is unavailable or the initial connection cannot use Fast Open.
+
 # [1.10.1] – 2026-11-01
 
 ## Added
