@@ -1,3 +1,19 @@
+# [1.12.0] – 2026-11-02
+
+## Fixed
+
+- **DNS-over-QUIC RFC 9250 compliance** – Zero the DNS Message ID on the outbound DoQ wire (RFC 9250 §4.2.1) and reject any upstream response that carries a nonzero ID, which §4.3.3 defines as a fatal protocol error. Previously the client's ID was forwarded verbatim and a compliant upstream reply (ID = 0) was rejected as a mismatch, so a fully compliant DoQ server could not be used at all. The client's original transaction ID is now restored on the response so downstream consumers continue to see matching IDs.
+
+- **DoQ peer protocol errors are surfaced with the correct QUIC error code** – When a DoQ peer violates RFC 9250 §4.3.3 (nonzero message ID, malformed framing, or question mismatch), close the QUIC connection with `DOQ_PROTOCOL_ERROR` (0x2) via `CONNECTION_CLOSE` instead of silently dropping the connection. This gives peer implementations an actionable signal and avoids holding half-open streams for the full query timeout.
+
+- **Stricter DoQ framing validation** – Require the 2-byte length prefix to match the received stream exactly and to be at least the 12-byte DNS header size before parsing, then reject and close on violation. Previously a short response or one with trailing bytes was tolerated until the next layer failed.
+
+## Changed
+
+- **DoQ test coverage** – Existing DoQ tests now assert the wire-format contract (sent message begins with `\x00\x00`, returned response has the client's original transaction ID) and the new `DOQ_PROTOCOL_ERROR` connection-close path (`error_code=0x2,reason_phrase="DoQ DNS Message ID is not zero"`).
+
+- **DoQ response acceptance** – A reply that has ID=0 and a matching question is now the only successful outcome; anything else triggers the §4.3.3 close path, matching compliant DoQ server behaviour.
+
 # [1.11.0] – 2026-11-02
 
 ## Added
