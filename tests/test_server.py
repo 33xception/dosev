@@ -469,3 +469,63 @@ async def test_handle_doh_request_returns_bad_request_for_missing_dns(monkeypatc
     response = await _handle_doh_request(FakeRequest(), holder)
     assert response.status == 400
     assert 'Missing dns parameter' in response.text
+
+
+# ---------- Regression test for trust_anchors_file bug ----------
+@pytest.mark.asyncio
+async def test_trust_anchors_file_passed_correctly(tmp_path):
+    """
+    Regression test for: {'file': path} in _load_trust_anchors is broken.
+    
+    When trust_anchors_file is set, server.py should pass the file path as a string
+    directly to the resolver, not wrapped in a {'file': path} dict.
+    """
+    # Create a temporary trust anchors file
+    anchors_file = tmp_path / "trust_anchors.txt"
+    anchors_file.write_text(
+        ". 3600 IN DNSKEY 257 3 8 AwEAAaz/tAm8yTn4Mfeh5eyI96WSVexTBAvkMgJzkKTOiW1vkIbzxeF3+/4RgWOq7HrxRixHlFlExOLAJr5emLvN7SWXgnLh4+B5xQlNVz8Og8kvArMtNROxVQuCaSnIDdD5LKyWbRd2n9WGe2R8PzgCmr3EgVLrjyBxWezF0jLHwVN8efS3rCj/EWgvIWgb9tarpVUDK/b58Da+Erq1sBvNaRfxv4d8+1o5RsS5rG3FJ0fruu1Wg+0JvN6sL5nlk46iS2BsUj8IYL0=\n"
+    )
+    
+    # This should not raise AttributeError: 'str' object has no attribute 'name'
+    resolver = DNSResolver(
+        upstreams=[{"address": "1.1.1.1", "protocol": "udp", "ip": "1.1.1.1"}],
+        dnssec_enabled=True,
+        trust_anchors=str(anchors_file)
+    )
+    
+    # Verify the trust anchor was loaded correctly
+    assert resolver._dnssec_raw_anchors is not None
+    import dns.name
+    assert dns.name.root in resolver._dnssec_raw_anchors
+
+
+@pytest.mark.asyncio
+async def test_trust_anchors_file_passed_via_config(tmp_path):
+    """
+    Test that trust_anchors_file works correctly when passed via config dict
+    in reload_resolver.
+    """
+    # Create a temporary trust anchors file
+    anchors_file = tmp_path / "trust_anchors.txt"
+    anchors_file.write_text(
+        ". 3600 IN DNSKEY 257 3 8 AwEAAaz/tAm8yTn4Mfeh5eyI96WSVexTBAvkMgJzkKTOiW1vkIbzxeF3+/4RgWOq7HrxRixHlFlExOLAJr5emLvN7SWXgnLh4+B5xQlNVz8Og8kvArMtNROxVQuCaSnIDdD5LKyWbRd2n9WGe2R8PzgCmr3EgVLrjyBxWezF0jLHwVN8efS3rCj/EWgvIWgb9tarpVUDK/b58Da+Erq1sBvNaRfxv4d8+1o5RsS5rG3FJ0fruu1Wg+0JvN6sL5nlk46iS2BsUj8IYL0=\n"
+    )
+    
+    resolver = DNSResolver(
+        upstreams=[{"address": "1.1.1.1", "protocol": "udp", "ip": "1.1.1.1"}],
+        dnssec_enabled=True
+    )
+    holder = ResolverHolder(resolver)
+    
+    config = {
+        'dnssec_enabled': True,
+        'trust_anchors_file': str(anchors_file),
+    }
+    
+    # This should not raise AttributeError
+    await reload_resolver(holder, config, resolver)
+    
+    # Verify the trust anchor was loaded correctly
+    assert resolver._dnssec_raw_anchors is not None
+    import dns.name
+    assert dns.name.root in resolver._dnssec_raw_anchors
