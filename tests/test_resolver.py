@@ -2195,7 +2195,7 @@ async def test_forward_tcp_uses_ip_override():
                 mock_resolve.return_value = "192.0.2.1"
                 result = await resolver._forward_tcp(data, upstream)
                 assert result == resp_wire
-            mock_connect.assert_awaited_once_with("192.0.2.1", 5353)
+            mock_connect.assert_awaited_once_with("192.0.2.1", 5353, len(data).to_bytes(2, "big") + data)
 
 
 @pytest.mark.asyncio
@@ -2747,3 +2747,177 @@ async def test_client_subnets_do_not_share_ecs_cached_answers(monkeypatch):
     assert upstream_subnets == [("198.51.100.0", 24), ("198.51.101.0", 24)]
     assert dns.message.from_wire(first).answer[0][0].address == "192.0.2.1"
     assert dns.message.from_wire(second).answer[0][0].address == "192.0.2.2"
+
+# ---------- TCP Fast Open Regression Tests ----------
+
+@pytest.mark.asyncio
+async def test_msfastopen_partial_send_writes_remainder(monkeypatch):
+    """Test that MSG_FASTOPEN partial send writes remainder via StreamWriter."""
+    import errno as errno_module
+    
+    msg_fastopen = 0x20000000  # MSG_FASTOPEN value
+    data = b'\x00\x05\x01\x02\x03\x04\x05'  # 7 bytes
+    monkeypatch.setattr(socket, 'MSG_FASTOPEN', msg_fastopen, raising=False)
+    
+    resolver = DNSResolver(tcp_fastopen_enabled=True)
+    
+    class FakeSocket:
+        def __init__(self):
+            self.blocking_flag = True
+            self.closed = False
+            
+        def setblocking(self, flag):
+            self.blocking_flag = flag
+            
+        def sendto(self, data, addr, flags):
+            # Return 4 bytes sent (partial send)
+            return 4
+            
+        def close(self):
+            self.closed = True
+    
+    fake_socket = FakeSocket()
+    monkeypatch.setattr(socket, 'socket', lambda *args: fake_socket)
+    
+    reader = MagicMock()
+    writer = MagicMock()
+    writer.write = MagicMock()
+    writer.drain = AsyncMock()
+    
+    open_connection = AsyncMock(return_value=(reader, writer))
+    monkeypatch.setattr(asyncio, 'open_connection', open_connection)
+    
+    await resolver._open_tcp_connection('192.0.2.1', 53, data)
+    
+    # Verify that partial data was sent via sendto (4 bytes)
+    # And remainder was written via StreamWriter (3 bytes)
+    assert writer.write.call_count == 1
+    written_data = writer.write.call_args[0][0]
+    assert written_data == data[4:]  # Remainder: bytes 4-6
+
+
+@pytest.mark.asyncio
+async def test_msfastopen_einprogress_writes_full_data_once(monkeypatch):
+    """Test that MSG_FASTOPEN EINPROGRESS writes full data once (no double-write)."""
+    import errno as errno_module
+    
+    msg_fastopen = 0x20000000  # MSG_FASTOPEN value
+    data = b'\x00\x05\x01\x02\x03\x04\x05'  # 7 bytes
+    monkeypatch.setattr(socket, 'MSG_FASTOPEN', msg_fastopen, raising=False)
+    
+    resolver = DNSResolver(tcp_fastopen_enabled=True)
+    
+    class FakeSocket:
+        def __init__(self):
+            self.blocking_flag = True
+            self.closed = False
+            
+        def setblocking(self, flag):
+            self.blocking_flag = flag
+            
+        def sendto(self, data, addr, flags):
+            # Raise EINPROGRESS - no data queued per kernel patch
+            raise BlockingIOError()
+            
+        def close(self):
+            self.closed = True
+    
+    fake_socket = FakeSocket()
+    monkeypatch.setattr(socket, 'socket', lambda *args: fake_socket)
+    
+    reader = MagicMock()
+    writer = MagicMock()
+    writer.write = MagicMock()
+    writer.drain = AsyncMock()
+    
+    open_connection = AsyncMock(return_value=(reader, writer))
+    monkeypatch.setattr(asyncio, 'open_connection', open_connection)
+    
+    await resolver._open_tcp_connection('192.0.2.1', 53, data)
+    
+    # Verify that full data was written exactly once via StreamWriter
+    assert writer.write.call_count == 1
+    written_data = writer.write.call_args[0][0]
+    assert written_data == data  # Full data written once
+
+
+@pytest.mark.asyncio
+async def test_tcp_fastopen_connect_partial_send_writes_remainder(monkeypatch):
+    """Test that TCP_FASTOPEN_CONNECT partial send writes remainder via StreamWriter."""
+    fastopen_connect = 30  # TCP_FASTOPEN_CONNECT value
+    data = b'\x00\x05\x01\x02\x03\x04\x05'  # 7 bytes
+    monkeypatch.setattr(socket, 'TCP_FASTOPEN_CONNECT', fastopen_connect, raising=False)
+    
+    resolver = DNSResolver(tcp_fastopen_enabled=True)
+    
+    class FakeSocket:
+        def __init__(self):
+            self.blocking_flag = True
+            self.timeout_val = None
+            self.closed = False
+            self.connect_called = False
+            
+        def setsockopt(self, level, option, value):
+            pass
+            
+        def settimeout(self, timeout):
+            self.timeout_val = timeout
+            
+        def setblocking(self, flag):
+            self.blocking_flag = flag
+            
+        def connect(self, addr):
+            self.connect_called = True
+            # Simulate successful connect
+            
+        def send(self, data):
+            # Return 4 bytes sent (partial send)
+            return 4
+            
+        def close(self):
+            self.closed = True
+    
+    fake_socket = FakeSocket()
+    monkeypatch.setattr(socket, 'socket', lambda *args: fake_socket)
+    
+    async def fake_to_thread(func, *args):
+        func(*args)
+    monkeypatch.setattr(asyncio, 'to_thread', fake_to_thread)
+    
+    reader = MagicMock()
+    writer = MagicMock()
+    writer.write = MagicMock()
+    writer.drain = AsyncMock()
+    
+    open_connection = AsyncMock(return_value=(reader, writer))
+    monkeypatch.setattr(asyncio, 'open_connection', open_connection)
+    
+    await resolver._open_tcp_connection('192.0.2.1', 53, data)
+    
+    # Verify that partial data was sent via sock.send (4 bytes)
+    # And remainder was written via StreamWriter (3 bytes)
+    assert writer.write.call_count == 1
+    written_data = writer.write.call_args[0][0]
+    assert written_data == data[4:]  # Remainder: bytes 4-6
+
+
+@pytest.mark.asyncio
+async def test_reload_resolver_empty_trust_anchors_preserves_default(monkeypatch):
+    """Test that empty trust_anchors string preserves default anchors after reload."""
+    import dns.name
+    
+    resolver = DNSResolver(
+        upstreams=[{"address": "1.1.1.1", "protocol": "udp", "ip": "1.1.1.1"}],
+        dnssec_enabled=True,
+    )
+    
+    # Verify default trust anchors are loaded
+    assert resolver._dnssec_raw_anchors is not None
+    assert dns.name.root in resolver._dnssec_raw_anchors
+    
+    # Reload with empty trust_anchors_file
+    await resolver.update_config(trust_anchors="")
+    
+    # Verify default trust anchors are still present (not cleared by empty string)
+    assert resolver._dnssec_raw_anchors is not None
+    assert dns.name.root in resolver._dnssec_raw_anchors

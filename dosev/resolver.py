@@ -1,4 +1,5 @@
 import asyncio
+import errno
 import logging
 import socket
 import ssl
@@ -3424,12 +3425,15 @@ class DNSResolver:
             resolved = await self._resolve_upstream_ip(host, ip_override)
             if self.disable_ipv6 and self._is_ipv6_address(resolved):
                 raise Exception("IPv6 disabled but resolved to IPv6")
-            reader, writer = await self._open_tcp_connection(resolved, int(port))
+            reader, writer = await self._open_tcp_connection(
+                resolved, int(port), len(data).to_bytes(2, "big") + data
+            )
 
         reusable = False
         try:
-            writer.write(len(data).to_bytes(2, "big") + data)
-            await writer.drain()
+            if pooled:
+                writer.write(len(data).to_bytes(2, "big") + data)
+                await writer.drain()
 
             length_bytes = await asyncio.wait_for(reader.readexactly(2), timeout=self.tcp_timeout)
             length = int.from_bytes(length_bytes, 'big')
@@ -3462,28 +3466,144 @@ class DNSResolver:
                 except (Exception, asyncio.CancelledError):
                     pass
 
-    async def _open_tcp_connection(self, host: str, port: int) -> Tuple[asyncio.StreamReader, asyncio.StreamWriter]:
-        fastopen_option = getattr(socket, 'TCP_FASTOPEN_CONNECT', None)
-        if not self.tcp_fastopen_enabled or fastopen_option is None:
-            return await asyncio.open_connection(host, port)
-
+    async def _open_tcp_connection(self, host: str, port: int, 
+                                    data: Optional[bytes] = None) -> Tuple[asyncio.StreamReader, asyncio.StreamWriter]:
+        """
+        Open a TCP connection, optionally sending data with SYN via TCP Fast Open.
+        
+        Per RFC 7413 (TCP Fast Open):
+        - Client MUST first request a cookie from the server with a SYN containing
+          an empty Fast Open option (cookie field length = 0).
+        - Server responds with SYN-ACK containing a cookie in the Fast Open option.
+        - On subsequent connections, client sends data in SYN with a valid cookie.
+        
+        Per send(2) man page (MSG_FASTOPEN):
+        - For non-blocking socket: returns number of bytes buffered and sent in SYN
+          packet if cookie is available.
+        - If cookie not available: returns -1 with errno=EINPROGRESS, sends SYN with
+          Fast Open cookie request. Caller must write data again when connected.
+        - On EAGAIN: no data is queued, must retry full write after connection.
+        
+        Per tcp(7) man page (TCP_FASTOPEN_CONNECT):
+        - When cookie is available, connect(2) returns 0 immediately but SYN is
+          deferred. Subsequent write() triggers SYN with data.
+        - Application MUST call write() immediately after connect() for TFO to work.
+        """
+        msg_fastopen = getattr(socket, 'MSG_FASTOPEN', None)
+        fastopen_connect = getattr(socket, 'TCP_FASTOPEN_CONNECT', None)
+        
+        # If TFO disabled or not supported by kernel, use normal connection
+        if not self.tcp_fastopen_enabled or (msg_fastopen is None and fastopen_connect is None):
+            reader, writer = await asyncio.open_connection(host, port)
+            if data is not None:
+                writer.write(data)
+                await writer.drain()
+            return reader, writer
+        
         family = socket.AF_INET6 if self._is_ipv6_address(host) else socket.AF_INET
         sock = socket.socket(family, socket.SOCK_STREAM)
+        
         try:
-            try:
-                sock.setsockopt(socket.IPPROTO_TCP, fastopen_option, 1)
-            except OSError:
-                sock.close()
-                return await asyncio.open_connection(host, port)
-
-            sock.settimeout(self.tcp_timeout)
-            try:
-                await asyncio.to_thread(sock.connect, (host, port))
-            except BlockingIOError:
-                sock.close()
-                return await asyncio.open_connection(host, port)
-            sock.setblocking(False)
-            return await asyncio.open_connection(sock=sock)
+            # Try MSG_FASTOPEN first (available on Linux 3.7+)
+            if msg_fastopen is not None and data is not None:
+                sock.setblocking(False)
+                try:
+                    # sendto with MSG_FASTOPEN performs implicit connect and sends data in SYN
+                    # Per send(2): returns bytes sent (>=0) or raises BlockingIOError/EINPROGRESS
+                    sent = sock.sendto(data, (host, port), msg_fastopen)
+                    # If we get here, sendto succeeded and returned bytes sent
+                    reader, writer = await asyncio.open_connection(sock=sock)
+                    if sent < len(data):
+                        # Partial send - RFC 1035 \u00a74.2.2 requires full query
+                        writer.write(data[sent:])
+                        await writer.drain()
+                    return reader, writer
+                except BlockingIOError:
+                    # Per send(2): EINPROGRESS means cookie not available, SYN sent with cookie request
+                    # Per kernel patch: no data is queued - must write full data after connection
+                    pass
+                except OSError as e:
+                    # EAGAIN: no data queued per kernel patch description
+                    # Other errors: fallback to normal TCP
+                    if e.errno not in (errno.EINPROGRESS, errno.EAGAIN):
+                        sock.close()
+                        reader, writer = await asyncio.open_connection(host, port)
+                        if data is not None:
+                            writer.write(data)
+                            await writer.drain()
+                        return reader, writer
+                    # EINPROGRESS/EAGAIN: no data queued, write full data after connection
+                    pass
+                
+                # Connection in progress (EINPROGRESS/EAGAIN from sendto)
+                # Per send(2) and kernel patch: no data was queued
+                reader, writer = await asyncio.open_connection(sock=sock)
+                if data is not None:
+                    writer.write(data)
+                    await writer.drain()
+                return reader, writer
+            
+            # Try TCP_FASTOPEN_CONNECT (available on Linux 4.11+)
+            if fastopen_connect is not None:
+                try:
+                    sock.setsockopt(socket.IPPROTO_TCP, fastopen_connect, 1)
+                except OSError:
+                    sock.close()
+                    reader, writer = await asyncio.open_connection(host, port)
+                    if data is not None:
+                        writer.write(data)
+                        await writer.drain()
+                    return reader, writer
+                
+                # Use timeout for connect in case TFO not supported by peer
+                sock.settimeout(self.tcp_timeout)
+                try:
+                    # connect() may return immediately if cookie available (SYN deferred)
+                    # or block until handshake completes
+                    await asyncio.to_thread(sock.connect, (host, port))
+                except BlockingIOError:
+                    sock.close()
+                    reader, writer = await asyncio.open_connection(host, port)
+                    if data is not None:
+                        writer.write(data)
+                        await writer.drain()
+                    return reader, writer
+                
+                # Per tcp(7): write immediately after connect to trigger SYN with data
+                # If connect returned immediately (cookie available), write triggers SYN+data
+                # If connect blocked (no cookie), write sends data normally
+                sent = 0
+                data_sent = False
+                if data is not None:
+                    try:
+                        sent = sock.send(data)
+                        data_sent = True
+                    except (BlockingIOError, OSError):
+                        # send() would block or failed - will write via StreamWriter
+                        data_sent = False
+                
+                sock.setblocking(False)
+                reader, writer = await asyncio.open_connection(sock=sock)
+                if data is not None:
+                    if not data_sent:
+                        # Write full data
+                        writer.write(data)
+                        await writer.drain()
+                    elif sent < len(data):
+                        # Partial send - write remainder
+                        writer.write(data[sent:])
+                        await writer.drain()
+                    # else: full data sent via sock.send(), nothing more to do
+                return reader, writer
+            
+            # Neither MSG_FASTOPEN nor TCP_FASTOPEN_CONNECT available
+            sock.close()
+            reader, writer = await asyncio.open_connection(host, port)
+            if data is not None:
+                writer.write(data)
+                await writer.drain()
+            return reader, writer
+            
         except BaseException:
             sock.close()
             raise
